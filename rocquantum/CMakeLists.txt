@@ -72,3 +72,5 @@ add_subdirectory(src/hipStateVec)
 # add_subdirectory(tests/hipStateVec) # If you add tests later
 
 message(STATUS "rocQuantum project configured. HIP compiler: ${CMAKE_HIP_COMPILER}")
+
+add_subdirectory(python/rocq)
