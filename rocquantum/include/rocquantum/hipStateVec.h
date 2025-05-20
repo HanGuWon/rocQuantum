@@ -71,7 +71,7 @@ rocqStatus_t rocsvInitializeState(rocsvHandle_t handle, rocComplex* d_state, uns
  * @param[in] numQubits Total number of qubits in the state vector.
  * @param[in] qubitIndices Array of qubit indices the gate acts upon.
  * @param[in] numTargetQubits Number of target qubits (e.g., 1 for single-qubit gate, 2 for two-qubit gate).
- * @param[in] matrix Pointer to the gate matrix (host memory, column-major).
+ * @param[in] matrixDevice Pointer to the gate matrix (DEVICE memory, column-major).
  * @param[in] matrixDim Dimension of the gate matrix (e.g., 2 for 1-qubit, 4 for 2-qubit).
  * @return rocqStatus_t Status of the operation.
  */
@@ -80,7 +80,7 @@ rocqStatus_t rocsvApplyMatrix(rocsvHandle_t handle,
                               unsigned numQubits,
                               const unsigned* qubitIndices,
                               unsigned numTargetQubits,
-                              const rocComplex* matrix,
+                              const rocComplex* matrixDevice, // Changed from 'matrix'
                               unsigned matrixDim);
 
 /**

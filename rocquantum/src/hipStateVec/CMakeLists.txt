@@ -3,6 +3,7 @@ set(HIPSTATEVEC_SRC
     single_qubit_kernels.hip
     two_qubit_kernels.hip
     measurement_kernels.hip
+    multi_qubit_kernels.hip # Added this line
 )
 
 add_library(hipStateVec SHARED ${HIPSTATEVEC_SRC})

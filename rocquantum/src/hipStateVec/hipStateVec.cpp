@@ -1,5 +1,6 @@
 #include "rocquantum/hipStateVec.h" // Assuming this path will be set up in CMake include_directories
 #include <hip/hip_runtime.h>
+#include <rocblas/rocblas.h> // For rocBLAS
 #include <vector> // For std::vector, used in InitializeState for host-side buffer
 #include <cstring> // For memset, strcmp
 #include <string> // For std::string in comparisons (though not strictly needed for C API matrix type)
@@ -11,8 +12,9 @@
 // Define the internal handle structure
 struct rocsvInternalHandle {
     hipStream_t stream;
+    // hiprandGenerator_t rand_generator; // For future use with rocRAND state in handle
     int deviceId;
-    // Add other resources like rocBLAS handle if needed later
+    rocblas_handle blasHandle; // Added for rocBLAS
     // rocrand_generator rand_generator; // For measurement later
 };
 
@@ -27,6 +29,19 @@ rocqStatus_t checkHipError(hipError_t err, const char* operation = "") {
     return ROCQ_STATUS_SUCCESS;
 }
 
+// Helper to check rocBLAS errors and convert to rocqStatus_t
+rocqStatus_t checkRocblasError(rocblas_status err, const char* operation = "") {
+    if (err != rocblas_status_success) {
+        // In a real library, you might log rocblas_status_to_string(err)
+        // fprintf(stderr, "rocBLAS Error during %s: %s
+", operation, rocblas_status_to_string(err));
+        // Assuming a generic failure status for now. Could map specific rocBLAS errors to rocqStatus_t.
+        return ROCQ_STATUS_FAILURE; // Or a new ROCQ_STATUS_ROCBLAS_ERROR
+    }
+    return ROCQ_STATUS_SUCCESS;
+}
+
+
 extern "C" {
 
 rocqStatus_t rocsvCreate(rocsvHandle_t* handle) {
@@ -38,22 +53,42 @@ rocqStatus_t rocsvCreate(rocsvHandle_t* handle) {
     if (!internal_handle) {
         return ROCQ_STATUS_ALLOCATION_FAILED;
     }
+    internal_handle->stream = nullptr; // Initialize to prevent dangling pointer in cleanup
+    internal_handle->blasHandle = nullptr; // Initialize
 
-    hipError_t err = hipGetDevice(&internal_handle->deviceId);
-    if (err != hipSuccess) {
+    hipError_t hip_err;
+    rocblas_status blas_err;
+    // rocqStatus_t status; // Not needed here as we return directly
+
+    hip_err = hipGetDevice(&internal_handle->deviceId);
+    if (hip_err != hipSuccess) {
         delete internal_handle;
-        return checkHipError(err, "rocsvCreate hipGetDevice");
+        return checkHipError(hip_err, "rocsvCreate hipGetDevice");
     }
 
-    err = hipStreamCreate(&internal_handle->stream);
-    if (err != hipSuccess) {
+    hip_err = hipStreamCreate(&internal_handle->stream);
+    if (hip_err != hipSuccess) {
         delete internal_handle;
-        return checkHipError(err, "rocsvCreate hipStreamCreate");
+        return checkHipError(hip_err, "rocsvCreate hipStreamCreate");
+    }
+
+    blas_err = rocblas_create_handle(&internal_handle->blasHandle);
+    if (blas_err != rocblas_status_success) {
+        if (internal_handle->stream) hipStreamDestroy(internal_handle->stream);
+        delete internal_handle;
+        return checkRocblasError(blas_err, "rocsvCreate rocblas_create_handle");
+    }
+
+    blas_err = rocblas_set_stream(internal_handle->blasHandle, internal_handle->stream);
+    if (blas_err != rocblas_status_success) {
+        if (internal_handle->blasHandle) rocblas_destroy_handle(internal_handle->blasHandle);
+        if (internal_handle->stream) hipStreamDestroy(internal_handle->stream);
+        delete internal_handle;
+        return checkRocblasError(blas_err, "rocsvCreate rocblas_set_stream");
     }
     
     // TODO: Initialize rocRAND generator here if needed for measurement later
-    // TODO: Initialize rocBLAS handle here if it's to be part of the handle
-
+    
     *handle = internal_handle;
     return ROCQ_STATUS_SUCCESS;
 }
@@ -64,18 +99,29 @@ rocqStatus_t rocsvDestroy(rocsvHandle_t handle) {
     }
 
     rocsvInternalHandle* internal_handle = static_cast<rocsvInternalHandle*>(handle);
+    rocqStatus_t first_error_status = ROCQ_STATUS_SUCCESS; 
+
+    if (internal_handle->blasHandle) {
+        rocblas_status blas_err = rocblas_destroy_handle(internal_handle->blasHandle);
+        if (blas_err != rocblas_status_success) {
+            first_error_status = checkRocblasError(blas_err, "rocsvDestroy rocblas_destroy_handle");
+            // Log error but continue cleanup
+        }
+    }
 
     if (internal_handle->stream) {
-        hipError_t err = hipStreamDestroy(internal_handle->stream);
-        // Log error but continue cleanup
-        checkHipError(err, "rocsvDestroy hipStreamDestroy");
+        hipError_t hip_err = hipStreamDestroy(internal_handle->stream);
+        // Only update status if no prior error from rocblas_destroy_handle
+        if (hip_err != hipSuccess && first_error_status == ROCQ_STATUS_SUCCESS) { 
+            first_error_status = checkHipError(hip_err, "rocsvDestroy hipStreamDestroy");
+            // Log error but continue cleanup
+        }
     }
 
     // TODO: Destroy rocRAND generator
-    // TODO: Destroy rocBLAS handle
-
+    
     delete internal_handle;
-    return ROCQ_STATUS_SUCCESS;
+    return first_error_status; // Return status of first error encountered, or SUCCESS
 }
 
 rocqStatus_t rocsvAllocateState(rocsvHandle_t handle, unsigned numQubits, rocComplex** d_state) {
@@ -181,262 +227,139 @@ __global__ void collapse_state_kernel(rocComplex* state, unsigned numQubits, uns
 __global__ void sum_sq_magnitudes_kernel(const rocComplex* state, unsigned numQubits, double* d_sum_sq_mag);
 __global__ void renormalize_state_kernel(rocComplex* state, unsigned numQubits, double d_sum_sq_mag_inv_sqrt);
 
+// Forward declarations for kernels from multi_qubit_kernels.hip
+__global__ void apply_three_qubit_generic_matrix_kernel(rocComplex* state, unsigned numQubits, const unsigned* targetQubitIndices_gpu, const rocComplex* matrixDevice);
+__global__ void apply_four_qubit_generic_matrix_kernel(rocComplex* state, unsigned numQubits, const unsigned* targetQubitIndices_gpu, const rocComplex* matrixDevice);
 
-// Helper to get matrix type (for specialized gates)
-// This is a simplification; a real implementation might pass gate type enum
-// or always use the generic kernel if matrix is arbitrary.
-enum GateType {
-    GATE_X, GATE_Y, GATE_Z, GATE_H, GATE_S, GATE_T,
-    GATE_RX, GATE_RY, GATE_RZ,
-    GATE_CNOT, GATE_CZ, GATE_SWAP,
-    GATE_GENERIC_1Q, GATE_GENERIC_2Q, GATE_UNKNOWN
-};
+// rocsvApplyMatrix now takes matrixDevice directly.
+// The get_gate_type function and GateType enum are removed as per simplification.
+// Dispatch will rely on numTargetQubits, and always use generic kernels.
+// Specialized kernels (X, H, CNOT etc.) would typically be called via
+// dedicated API functions (e.g., rocsvApplyX, rocsvApplyCNOT) which are not part of this scope.
 
-GateType get_gate_type(unsigned numTargetQubits, const rocComplex* matrix, unsigned matrixDim, float& angle) {
-    // This is a placeholder. In a real system, you wouldn't typically deduce gate type from matrix.
-    // Instead, the API would take a gate enum or the matrix itself would be the sole source of truth for generic kernels.
-    // For this exercise, we'll make some simple checks for common known matrices to call specialized kernels.
-    // Angle is an out-parameter for rotation gates.
-    
-    // Note: Comparing floating point numbers for equality is generally bad.
-    // This is purely for enabling the dispatch to specialized kernels as per plan.
-    // A robust solution would involve specific API entry points for named gates,
-    // or passing an enum for the gate type if a common applyMatrix is used.
-
-    if (numTargetQubits == 1 && matrixDim == 2) {
-        // X: [[0,1],[1,0]] -> M[0]={0,0}, M[1]={1,0}, M[2]={1,0}, M[3]={0,0} (col-major)
-        if (matrix[0].x == 0.f && matrix[0].y == 0.f &&
-            matrix[1].x == 1.f && matrix[1].y == 0.f &&
-            matrix[2].x == 1.f && matrix[2].y == 0.f &&
-            matrix[3].x == 0.f && matrix[3].y == 0.f) return GATE_X;
-        // H: 1/sqrt(2) * [[1,1],[1,-1]]
-        float h_val = 1.f/sqrtf(2.f);
-        if (fabsf(matrix[0].x - h_val) < 1e-6 && fabsf(matrix[0].y) < 1e-6 &&
-            fabsf(matrix[1].x - h_val) < 1e-6 && fabsf(matrix[1].y) < 1e-6 &&
-            fabsf(matrix[2].x - h_val) < 1e-6 && fabsf(matrix[2].y) < 1e-6 &&
-            fabsf(matrix[3].x - (-h_val)) < 1e-6 && fabsf(matrix[3].y) < 1e-6) return GATE_H;
-        // Could add more checks for Y, Z, S, T, Rx, Ry, Rz if specific matrices are passed...
-        // For Rz(theta) = [[exp(-it/2),0],[0,exp(it/2)]]
-        // M00 = cos(t/2)-i*sin(t/2), M11 = cos(t/2)+i*sin(t/2)
-        // If M01 and M10 are zero
-        if (matrix[2].x == 0.f && matrix[2].y == 0.f && matrix[1].x == 0.f && matrix[1].y == 0.f) {
-            // Check if it's Rz
-            // angle = 2 * acosf(matrix[0].x) or 2 * asinf(-matrix[0].y) if cos(t/2) > 0
-            // This is tricky. Let's assume if no other known gate matches, it's generic.
-            // For simplicity, we'll mostly rely on generic for rotations unless a dedicated API is made.
-        }
-        return GATE_GENERIC_1Q;
-    }
-    if (numTargetQubits == 2 && matrixDim == 4) {
-        // CNOT (control=q1, target=q0): [[1,0,0,0],[0,1,0,0],[0,0,0,1],[0,0,1,0]]
-        // M[0]=1, M[1]=0, M[2]=0, M[3]=0
-        // M[4]=0, M[5]=1, M[6]=0, M[7]=0
-        // M[8]=0, M[9]=0, M[10]=0,M[11]=1
-        // M[12]=0,M[13]=0, M[14]=1,M[15]=0
-        bool is_cnot = matrix[0].x == 1.f && matrix[0].y == 0.f &&
-                       matrix[1].x == 0.f && matrix[1].y == 0.f &&
-                       matrix[2].x == 0.f && matrix[2].y == 0.f &&
-                       matrix[3].x == 0.f && matrix[3].y == 0.f &&
-                       matrix[4].x == 0.f && matrix[4].y == 0.f &&
-                       matrix[5].x == 1.f && matrix[5].y == 0.f &&
-                       matrix[6].x == 0.f && matrix[6].y == 0.f &&
-                       matrix[7].x == 0.f && matrix[7].y == 0.f &&
-                       matrix[8].x == 0.f && matrix[8].y == 0.f &&
-                       matrix[9].x == 0.f && matrix[9].y == 0.f &&
-                       matrix[10].x == 0.f && matrix[10].y == 0.f && // This was M[10]=0
-                       matrix[11].x == 1.f && matrix[11].y == 0.f && // This was M[11]=1 (oops, this is M[2][3])
-                                                                  // Correct CNOT matrix (Col Major):
-                                                                  // 1 0 0 0
-                                                                  // 0 1 0 0
-                                                                  // 0 0 0 1
-                                                                  // 0 0 1 0
-                                                                  // M[0]=1, M[5]=1, M[11]=1 (this is M[3][2]), M[14]=1 (this is M[2][3])
-                                                                  // The indices for CNOT matrix:
-                                                                  // M[0]=1 (0,0)
-                                                                  // M[5]=1 (1,1)
-                                                                  // M[11]=1 (3,2) maps input 2 to output 3
-                                                                  // M[14]=1 (2,3) maps input 3 to output 2
-                       // Checking the provided CNOT matrix values directly:
-                       matrix[0].x == 1.f && matrix[0].y == 0.f && /* M[0][0] */
-                       matrix[1].x == 0.f && matrix[1].y == 0.f && /* M[1][0] */
-                       matrix[2].x == 0.f && matrix[2].y == 0.f && /* M[2][0] */
-                       matrix[3].x == 0.f && matrix[3].y == 0.f && /* M[3][0] */
-
-                       matrix[4].x == 0.f && matrix[4].y == 0.f && /* M[0][1] */
-                       matrix[5].x == 1.f && matrix[5].y == 0.f && /* M[1][1] */
-                       matrix[6].x == 0.f && matrix[6].y == 0.f && /* M[2][1] */
-                       matrix[7].x == 0.f && matrix[7].y == 0.f && /* M[3][1] */
-
-                       matrix[8].x == 0.f && matrix[8].y == 0.f &&  /* M[0][2] */
-                       matrix[9].x == 0.f && matrix[9].y == 0.f &&  /* M[1][2] */
-                       matrix[10].x == 0.f && matrix[10].y == 0.f &&/* M[2][2] */ // This should be 0 for CNOT
-                       matrix[11].x == 1.f && matrix[11].y == 0.f &&/* M[3][2] */ // This should be 1 for CNOT
-
-                       matrix[12].x == 0.f && matrix[12].y == 0.f &&/* M[0][3] */
-                       matrix[13].x == 0.f && matrix[13].y == 0.f &&/* M[1][3] */
-                       matrix[14].x == 1.f && matrix[14].y == 0.f &&/* M[2][3] */ // This should be 1 for CNOT
-                       matrix[15].x == 0.f && matrix[15].y == 0.f;  /* M[3][3] */ // This should be 0 for CNOT
-
-        if (is_cnot) return GATE_CNOT;
-        return GATE_GENERIC_2Q;
-    }
-    return GATE_UNKNOWN;
-}
-
-
-// Replacement for the rocsvApplyMatrix stub
 rocqStatus_t rocsvApplyMatrix(rocsvHandle_t handle,
                               rocComplex* d_state,
                               unsigned numQubits,
-                              const unsigned* qubitIndices, // Array of target qubit indices
-                              unsigned numTargetQubits,    // Number of qubits the gate acts on (1 or 2)
-                              const rocComplex* h_matrix,   // Gate matrix on HOST memory, column-major
-                              unsigned matrixDim) {        // Dimension of the matrix (2 for 1Q, 4 for 2Q)
-    if (!handle || !d_state || !qubitIndices || !h_matrix || numTargetQubits == 0 || numTargetQubits > 2 || matrixDim == 0) {
-        // Current implementation only supports 1 or 2 target qubits.
-        // numTargetQubits > 2 will be handled by rocBLAS or specialized kernels later.
-        if (numTargetQubits > 2) return ROCQ_STATUS_NOT_IMPLEMENTED; // Placeholder for rocBLAS
+                              const unsigned* qubitIndices, // HOST pointer to target qubit indices
+                              unsigned numTargetQubits,    // Number of qubits the gate acts on
+                              const rocComplex* matrixDevice, // Gate matrix on DEVICE memory
+                              unsigned matrixDim) {
+    if (!handle || !d_state || !qubitIndices || !matrixDevice) {
         return ROCQ_STATUS_INVALID_VALUE;
     }
-    if ((numTargetQubits == 1 && matrixDim != 2) || (numTargetQubits == 2 && matrixDim != 4)) {
-        return ROCQ_STATUS_INVALID_VALUE; // Matrix dimension mismatch
+    if (numTargetQubits == 0) { // Should have at least one target qubit
+        return ROCQ_STATUS_INVALID_VALUE;
+    }
+    // Validate matrixDim against numTargetQubits
+    if (!((numTargetQubits == 1 && matrixDim == 2) || 
+          (numTargetQubits == 2 && matrixDim == 4) ||
+          (numTargetQubits == 3 && matrixDim == 8) ||
+          (numTargetQubits == 4 && matrixDim == 16))) {
+        // If it's not one of the valid combinations and not covered by the >4 case below
+        if (numTargetQubits <= 4) return ROCQ_STATUS_INVALID_VALUE; 
+    }
+    
+    if (numTargetQubits > 4) { // Currently not implemented for more than 4 target qubits
+        return ROCQ_STATUS_NOT_IMPLEMENTED;
     }
 
     rocsvInternalHandle* internal_handle = static_cast<rocsvInternalHandle*>(handle);
     hipError_t hip_err;
+    rocqStatus_t status = ROCQ_STATUS_SUCCESS;
 
-    unsigned threads_per_block = 256; // Common choice
+    unsigned threads_per_block = 256; // A common choice, can be tuned
     size_t total_states = 1ULL << numQubits;
 
     if (numTargetQubits == 1) {
         unsigned targetQubit = qubitIndices[0];
         if (targetQubit >= numQubits) return ROCQ_STATUS_INVALID_VALUE;
 
-        size_t num_thread_groups = total_states / 2; // Each thread handles a pair
+        size_t num_thread_groups = total_states / 2;
         unsigned num_blocks = (num_thread_groups + threads_per_block - 1) / threads_per_block;
-        if (numQubits == 0) num_blocks = 0; // Edge case for 0 qubits, num_thread_groups would be 0.5 -> 0
-
-
-        float angle = 0.f; // Placeholder for rotation angles
-        GateType type = get_gate_type(numTargetQubits, h_matrix, matrixDim, angle);
-
-        rocComplex* d_matrix = nullptr;
-        if (type == GATE_GENERIC_1Q) { 
-            hip_err = hipMalloc(&d_matrix, matrixDim * matrixDim * sizeof(rocComplex));
-            if (hip_err != hipSuccess) return checkHipError(hip_err, "rocsvApplyMatrix hipMalloc for d_matrix");
-            hip_err = hipMemcpyAsync(d_matrix, h_matrix, matrixDim * matrixDim * sizeof(rocComplex), hipMemcpyHostToDevice, internal_handle->stream);
-            if (hip_err != hipSuccess) {
-                hipFree(d_matrix);
-                return checkHipError(hip_err, "rocsvApplyMatrix hipMemcpyAsync for d_matrix");
-            }
-        }
-        
-        if (type == GATE_X) {
-            hipLaunchKernelGGL(apply_X_kernel, dim3(num_blocks), dim3(threads_per_block), 0, internal_handle->stream, d_state, numQubits, targetQubit);
-        } else if (type == GATE_H) {
-            hipLaunchKernelGGL(apply_H_kernel, dim3(num_blocks), dim3(threads_per_block), 0, internal_handle->stream, d_state, numQubits, targetQubit);
-        }
-        else { 
-             if (!d_matrix) { 
-                hip_err = hipMalloc(&d_matrix, matrixDim * matrixDim * sizeof(rocComplex));
-                if (hip_err != hipSuccess) return checkHipError(hip_err, "rocsvApplyMatrix hipMalloc for d_matrix (fallback)");
-                hip_err = hipMemcpyAsync(d_matrix, h_matrix, matrixDim * matrixDim * sizeof(rocComplex), hipMemcpyHostToDevice, internal_handle->stream);
-                if (hip_err != hipSuccess) {
-                    hipFree(d_matrix);
-                    return checkHipError(hip_err, "rocsvApplyMatrix hipMemcpyAsync for d_matrix (fallback)");
-                }
-            }
-            hipLaunchKernelGGL(apply_single_qubit_generic_matrix_kernel, dim3(num_blocks), dim3(threads_per_block), 0, internal_handle->stream, d_state, numQubits, targetQubit, d_matrix);
-        }
-
+        if (num_thread_groups > 0 && num_blocks == 0) num_blocks = 1; // Ensure at least 1 block if work
+        else if (num_thread_groups == 0) num_blocks = 0; // No work if numQubits=0 (total_states=1, num_thread_groups=0)
+            
+        hipLaunchKernelGGL(apply_single_qubit_generic_matrix_kernel, dim3(num_blocks), dim3(threads_per_block), 0, internal_handle->stream, d_state, numQubits, targetQubit, matrixDevice);
         hip_err = hipGetLastError();
-        if (hip_err != hipSuccess) {
-            if (d_matrix) hipFree(d_matrix);
-            return checkHipError(hip_err, "rocsvApplyMatrix hipLaunchKernelGGL (1Q)");
-        }
-        if (d_matrix) { 
-            hipStreamSynchronize(internal_handle->stream); 
-            hipFree(d_matrix);
-        }
+        if (hip_err != hipSuccess) status = checkHipError(hip_err, "rocsvApplyMatrix hipLaunchKernelGGL (1Q)");
 
     } else if (numTargetQubits == 2) {
-        unsigned q0 = qubitIndices[0]; 
-        unsigned q1 = qubitIndices[1];
-        if (q0 >= numQubits || q1 >= numQubits || q0 == q1) return ROCQ_STATUS_INVALID_VALUE;
-        // Sorting for generic kernel is done below. For specific kernels like CNOT, the order might matter based on API contract.
+        if (qubitIndices[0] >= numQubits || qubitIndices[1] >= numQubits || qubitIndices[0] == qubitIndices[1]) {
+            return ROCQ_STATUS_INVALID_VALUE;
+        }
+        unsigned q0 = (qubitIndices[0] < qubitIndices[1]) ? qubitIndices[0] : qubitIndices[1];
+        unsigned q1 = (qubitIndices[0] < qubitIndices[1]) ? qubitIndices[1] : qubitIndices[0];
 
-        size_t num_thread_groups = total_states / 4; 
+        size_t num_thread_groups = total_states / 4;
         unsigned num_blocks = (num_thread_groups + threads_per_block - 1) / threads_per_block;
-        if (numQubits < 2) num_blocks = 0; // Edge case for <2 qubits
-        
-        float angle = 0.f; 
-        GateType type = get_gate_type(numTargetQubits, h_matrix, matrixDim, angle);
+        if (num_thread_groups > 0 && num_blocks == 0) num_blocks = 1;
+        else if (num_thread_groups == 0) num_blocks = 0; // No work if numQubits<2
 
-        rocComplex* d_matrix = nullptr;
-        if (type == GATE_GENERIC_2Q) { 
-            hip_err = hipMalloc(&d_matrix, matrixDim * matrixDim * sizeof(rocComplex));
-            if (hip_err != hipSuccess) return checkHipError(hip_err, "rocsvApplyMatrix hipMalloc for d_matrix (2Q)");
-            hip_err = hipMemcpyAsync(d_matrix, h_matrix, matrixDim * matrixDim * sizeof(rocComplex), hipMemcpyHostToDevice, internal_handle->stream);
-            if (hip_err != hipSuccess) {
-                hipFree(d_matrix);
-                return checkHipError(hip_err, "rocsvApplyMatrix hipMemcpyAsync for d_matrix (2Q)");
-            }
-        }
-
-        if (type == GATE_CNOT) {
-            // The CNOT kernel expects controlQubit_idx and targetQubit_idx.
-            // The get_gate_type CNOT check is for a matrix where q1 (higher index in pair) is control, q0 is target.
-            // API contract: qubitIndices[0] is control, qubitIndices[1] is target by default.
-            // If user provides [target, control], they must ensure matrix matches that, or API must be more explicit.
-            // For now, let's assume API implies qubitIndices[0]=control, qubitIndices[1]=target
-            // If the matrix provided (h_matrix) corresponds to CNOT(q1,q0) (q1=control)
-            // then controlIdx should be qubitIndices[1] and targetIdx qubitIndices[0] IF qubitIndices was [q0,q1].
-            // This part is tricky and depends on precise API definition vs matrix structure.
-            // Let's assume the API defines qubitIndices[0] as control and qubitIndices[1] as target.
-            unsigned controlIdx = qubitIndices[0];
-            unsigned targetIdx = qubitIndices[1];
-
-            // The CNOT kernel in two_qubit_kernels.hip is designed for (N/4) groups of threads,
-            // where each thread processes a pair of amplitudes where the control bit is 1.
-            // The number of such pairs is (total_states / 4) if control bit fixed, then /2 for pairs.
-            // No, the CNOT kernel iterates (1ULL<<(numQubits-2)) times.
-            unsigned cnot_work_items = (numQubits < 2) ? 0 : (1ULL << (numQubits - 2));
-            unsigned cnot_num_blocks = (cnot_work_items + threads_per_block - 1) / threads_per_block;
-
-
-            hipLaunchKernelGGL(apply_CNOT_kernel, dim3(cnot_num_blocks), dim3(threads_per_block), 0, internal_handle->stream, d_state, numQubits, controlIdx, targetIdx);
-        }
-        else { 
-            if (!d_matrix) { 
-                hip_err = hipMalloc(&d_matrix, matrixDim * matrixDim * sizeof(rocComplex));
-                if (hip_err != hipSuccess) return checkHipError(hip_err, "rocsvApplyMatrix hipMalloc for d_matrix (2Q fallback)");
-                hip_err = hipMemcpyAsync(d_matrix, h_matrix, matrixDim * matrixDim * sizeof(rocComplex), hipMemcpyHostToDevice, internal_handle->stream);
-                if (hip_err != hipSuccess) {
-                    hipFree(d_matrix);
-                    return checkHipError(hip_err, "rocsvApplyMatrix hipMemcpyAsync for d_matrix (2Q fallback)");
-                }
-            }
-            unsigned sorted_q0 = (qubitIndices[0] < qubitIndices[1]) ? qubitIndices[0] : qubitIndices[1];
-            unsigned sorted_q1 = (qubitIndices[0] < qubitIndices[1]) ? qubitIndices[1] : qubitIndices[0];
-            hipLaunchKernelGGL(apply_two_qubit_generic_matrix_kernel, dim3(num_blocks), dim3(threads_per_block), 0, internal_handle->stream, d_state, numQubits, sorted_q0, sorted_q1, d_matrix);
-        }
-
+        hipLaunchKernelGGL(apply_two_qubit_generic_matrix_kernel, dim3(num_blocks), dim3(threads_per_block), 0, internal_handle->stream, d_state, numQubits, q0, q1, matrixDevice);
         hip_err = hipGetLastError();
-        if (hip_err != hipSuccess) {
-            if (d_matrix) hipFree(d_matrix);
-            return checkHipError(hip_err, "rocsvApplyMatrix hipLaunchKernelGGL (2Q)");
-        }
-        if (d_matrix) {
-            hipStreamSynchronize(internal_handle->stream);
-            hipFree(d_matrix);
+        if (hip_err != hipSuccess) status = checkHipError(hip_err, "rocsvApplyMatrix hipLaunchKernelGGL (2Q)");
+
+    } else if (numTargetQubits == 3 || numTargetQubits == 4) {
+        for (unsigned i = 0; i < numTargetQubits; ++i) {
+            if (qubitIndices[i] >= numQubits) return ROCQ_STATUS_INVALID_VALUE;
+            for (unsigned j = i + 1; j < numTargetQubits; ++j) {
+                if (qubitIndices[i] == qubitIndices[j]) return ROCQ_STATUS_INVALID_VALUE; 
+            }
         }
 
-    } else {
-        return ROCQ_STATUS_NOT_IMPLEMENTED; 
+        unsigned* d_targetIndices = nullptr;
+        hip_err = hipMalloc(&d_targetIndices, numTargetQubits * sizeof(unsigned));
+        if (hip_err != hipSuccess) {
+            return checkHipError(hip_err, "rocsvApplyMatrix hipMalloc d_targetIndices");
+        }
+        // Ensure stream synchronization for hipMemcpyAsync if d_targetIndices is used immediately by a kernel on a different stream,
+        // but here it's the same stream. Kernel launch will be queued after memcpy.
+        hip_err = hipMemcpyAsync(d_targetIndices, qubitIndices, numTargetQubits * sizeof(unsigned), hipMemcpyHostToDevice, internal_handle->stream);
+        if (hip_err != hipSuccess) {
+            hipFree(d_targetIndices); // Clean up allocated memory
+            return checkHipError(hip_err, "rocsvApplyMatrix hipMemcpyAsync d_targetIndices");
+        }
+
+        size_t m_val = numTargetQubits;
+        size_t num_kernel_threads = (numQubits < m_val) ? 0 : (total_states >> m_val); // N / (2^m)
+        unsigned num_blocks = (num_kernel_threads + threads_per_block - 1) / threads_per_block;
+        if (num_kernel_threads > 0 && num_blocks == 0) num_blocks = 1;
+        if (num_kernel_threads == 0) num_blocks = 0;
+
+
+        if (num_blocks > 0) {
+            if (numTargetQubits == 3) {
+                hipLaunchKernelGGL(apply_three_qubit_generic_matrix_kernel, dim3(num_blocks), dim3(threads_per_block), 0, internal_handle->stream, d_state, numQubits, d_targetIndices, matrixDevice);
+            } else { // numTargetQubits == 4
+                hipLaunchKernelGGL(apply_four_qubit_generic_matrix_kernel, dim3(num_blocks), dim3(threads_per_block), 0, internal_handle->stream, d_state, numQubits, d_targetIndices, matrixDevice);
+            }
+            hip_err = hipGetLastError(); 
+            if (hip_err != hipSuccess) { // Kernel launch error
+                 status = checkHipError(hip_err, "rocsvApplyMatrix hipLaunchKernelGGL (MQ)");
+            }
+            // No specific stream sync here for d_targetIndices before free, as hipFree syncs on the device.
+            // However, if kernel failed to launch, d_targetIndices still needs freeing.
+            // If status is already error, we might skip further operations or syncs.
+        }
+        
+        // Free device memory for target indices
+        // This hipFree will synchronize the device, ensuring kernel completes before memory is freed,
+        // if the kernel was using d_targetIndices. This is a blocking call.
+        // If async kernel and async free were desired, a different sync mechanism would be needed.
+        hipError_t free_err = hipFree(d_targetIndices);
+        if (free_err != hipSuccess && status == ROCQ_STATUS_SUCCESS) { 
+            status = checkHipError(free_err, "rocsvApplyMatrix hipFree d_targetIndices");
+        }
     }
+    // else: numTargetQubits > 4 is already handled at the start.
     
-    hip_err = hipStreamSynchronize(internal_handle->stream);
-    return checkHipError(hip_err, "rocsvApplyMatrix hipStreamSynchronize");
+    if (status == ROCQ_STATUS_SUCCESS) {
+        hip_err = hipStreamSynchronize(internal_handle->stream);
+        if (hip_err != hipSuccess) {
+            status = checkHipError(hip_err, "rocsvApplyMatrix hipStreamSynchronize at end");
+        }
+    }
+    return status;
 }
 
 // Actual implementation for rocsvMeasure
@@ -499,23 +422,10 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
 
     // 2. Determine outcome using random number generator
     // Using hiprand for simplicity. rocRAND would be more robust.
-    // TODO: Initialize hiprand generator in rocsvCreate and store in handle if we want sequences.
-    // For a single call, this might be okay.
+    // TODO: Initialize hiprand generator in rocsvCreate (e.g. internal_handle->rand_generator)
+    // and use it here. For now, using CPU rand() for simplicity of this step.
+    // hiprandStatus_t rand_status = hiprandGenerateUniformDouble(internal_handle->rand_generator, d_rand_val, 1);
     
-    // Quick and dirty for now, seed with time. NOT THREAD SAFE if multiple streams/calls.
-    // A proper rocRAND setup per handle is needed.
-    // hiprandState_t rand_state; 
-    // hiprandCreateGenerator(&rand_state, HIPRAND_RNG_PSEUDO_DEFAULT);
-    // hiprandSetPseudoRandomGeneratorSeed(rand_state, (unsigned long long)time(NULL)); // Bad seed for HPC
-    // double* d_rand_val; 
-    // hip_err = hipMalloc(&d_rand_val, sizeof(double));
-    // // hiprandGenerateUniformDouble (rand_state, d_rand_val, 1); // This is a device call, result on device
-    // // hiprandDestroyGenerator(rand_state); // Clean up temp generator
-    // // hipMemcpy(&rand_val, d_rand_val, sizeof(double), hipMemcpyDeviceToHost, internal_handle->stream);
-    // // hipFree(d_rand_val);
-    // // hipStreamSynchronize(internal_handle->stream);
-    
-    // For this example, let's use a CPU-based random number.
     static bool seeded = false; if (!seeded) { srand((unsigned int)time(NULL)); seeded = true; }
     double rand_val = (double)rand() / RAND_MAX;
 
@@ -529,11 +439,11 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
     }
 
     // 3. Collapse state vector
-    unsigned threads_per_block = 256;
-    unsigned num_blocks = ( (1ULL << numQubits) + threads_per_block - 1) / threads_per_block;
-    if (numQubits == 0) num_blocks = 0; // handle numQubits = 0 case for (1ULL << 0) = 1 state
+    unsigned threads_per_block_measure = 256;
+    unsigned num_blocks_measure = ( (1ULL << numQubits) + threads_per_block_measure - 1) / threads_per_block_measure;
+    if (numQubits == 0) num_blocks_measure = 0; 
 
-    hipLaunchKernelGGL(collapse_state_kernel, dim3(num_blocks), dim3(threads_per_block), 0, internal_handle->stream,
+    hipLaunchKernelGGL(collapse_state_kernel, dim3(num_blocks_measure), dim3(threads_per_block_measure), 0, internal_handle->stream,
                        d_state, numQubits, qubitToMeasure, *h_outcome);
     hip_err = hipGetLastError();
     if (hip_err != hipSuccess) {
@@ -541,7 +451,6 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
     }
 
     // 4. Re-normalize state vector
-    // First, calculate new sum of squared magnitudes of the collapsed state
     double* d_sum_sq_mag = nullptr;
     double h_sum_sq_mag = 0.0;
     hip_err = hipMalloc(&d_sum_sq_mag, sizeof(double));
@@ -562,7 +471,7 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
         hipFree(d_sum_sq_mag);
         return status;
     }
-    hip_err = hipStreamSynchronize(internal_handle->stream); // Wait for calc and copy
+    hip_err = hipStreamSynchronize(internal_handle->stream); 
     if (hip_err != hipSuccess) {
         status = checkHipError(hip_err, "rocsvMeasure hipStreamSynchronize after sum_sq_mag calc");
         hipFree(d_sum_sq_mag);
@@ -570,21 +479,15 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
     }
     hipFree(d_sum_sq_mag);
 
-    if (h_sum_sq_mag < 1e-12) { // Effectively zero, avoid division by zero. State might be all zeros.
-        // This can happen if the measured state had zero probability.
-        // Or if original state was not normalized. For now, just return.
-        // A robust system might re-initialize or error.
-        // If the probability of the measured outcome was itself ~0, then sum_sq_mag will be ~0.
-        // In this case, the state is effectively zero and doesn't need renormalization.
-        // Or, if *h_probability is very small, this is expected.
-        if (*h_probability > 1e-9) { // Only if the probability of this outcome was non-trivial
+    if (h_sum_sq_mag < 1e-12) { 
+        if (*h_probability > 1e-9) { 
              // This is an unexpected scenario if prob of outcome was high.
         }
         return ROCQ_STATUS_SUCCESS; 
     }
     double norm_factor = 1.0 / sqrt(h_sum_sq_mag);
 
-    hipLaunchKernelGGL(renormalize_state_kernel, dim3(num_blocks), dim3(threads_per_block), 0, internal_handle->stream,
+    hipLaunchKernelGGL(renormalize_state_kernel, dim3(num_blocks_measure), dim3(threads_per_block_measure), 0, internal_handle->stream,
                        d_state, numQubits, norm_factor);
     hip_err = hipGetLastError();
     if (hip_err != hipSuccess) {
