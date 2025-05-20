@@ -131,3 +131,100 @@ __global__ void apply_four_qubit_generic_matrix_kernel(
     
     apply_multi_qubit_generic_matrix_kernel(state, numQubits, targetQubitIndices_gpu, 4, matrixDevice);
 }
+
+// Kernel to gather 2^m elements from their scattered positions in d_in_strided (full state vector)
+// into a contiguous d_out_contiguous buffer.
+// non_target_config_thread_idx: Identifies which configuration of non-target qubits this gather operation is for.
+//                               It ranges from 0 to (2^(N-m) - 1).
+// targetQubitIndices_gpu: Array of m target qubit indices, already on GPU.
+/*
+__global__ void gather_elements_kernel(
+    rocComplex* d_out_contiguous,         // Output: Contiguous buffer of size 2^m
+    const rocComplex* d_in_strided,       // Input: Full state vector (size 2^N)
+    unsigned numQubits,                   // N
+    const unsigned* targetQubitIndices_gpu, // m target qubit indices (on GPU)
+    unsigned m) {                         // Number of target qubits
+
+    // This kernel is launched with (2^m) threads, one for each element to gather.
+    // It performs a single gather operation for *one* specific configuration of non-target qubits.
+    // The information about which non-target configuration is processed must be implicitly
+    // managed by how this kernel is called or by an additional parameter if this kernel
+    // itself were to loop (which it currently does not).
+    // For the current plan (host-side loop over non_target_config_idx), this kernel
+    // would be called 2^(N-m) times. The d_out_contiguous would point to the start
+    // of the *same* temp buffer each time. The d_in_strided is always the full state vector.
+    // The key is that the *effective* addresses read from d_in_strided must change
+    // for each of those 2^(N-m) calls. This is achieved by the calling code preparing
+    // the correct base_idx_for_non_targets and adding it to target_config_component.
+
+    // Let's refine the gather kernel to take base_idx_for_non_targets directly.
+    // This means the host loop calculates base_idx_for_non_targets and passes it.
+    // The kernel is launched with 2^m threads.
+
+    // This refined kernel is called by the host 2^(N-m) times.
+    // Each launch has 2^m threads.
+    // targetQubitIndices_gpu must be sorted for this indexing to map i correctly.
+    // (Caller of rocsvApplyMatrix should ensure qubitIndices are sorted before passing to kernel or sort internally)
+    
+    // This kernel is launched with `matrix_dim` (i.e., 2^m) threads.
+    // Each thread `i` (from 0 to 2^m - 1) calculates one source index and copies one element.
+    // `base_idx_for_non_targets_host_provided` is the component of the index from non-target qubits,
+    // pre-calculated by the host for the current block.
+    
+    // For gather_elements_kernel_v2:
+    // Grid: 1 block, Block: matrix_dim (2^m) threads.
+    // Or, if matrix_dim is large, (matrix_dim / threads_per_block_max_256) blocks.
+}
+*/
+
+// Refined Gather Kernel:
+// Gathers 2^m elements for a *single* specified configuration of non-target qubits.
+// Launched with matrix_dim threads (e.g., 32 threads for m=5).
+// base_idx_non_targets: The component of the index determined by the fixed state of non-target qubits for this specific gather op.
+__global__ void gather_elements_kernel_v2(
+    rocComplex* d_out_contiguous,           // Output: Contiguous buffer of size 2^m (matrix_dim)
+    const rocComplex* d_in_strided,         // Input: Full state vector (size 2^N)
+    const unsigned* targetQubitIndices_gpu, // m target qubit indices (on GPU, assumed sorted by convention for this kernel)
+    unsigned m,                             // Number of target qubits
+    size_t base_idx_non_targets) {          // Index component from non-target qubits
+
+    unsigned matrix_dim = 1U << m;
+    unsigned i = threadIdx.x + blockIdx.x * blockDim.x; // i from 0 to matrix_dim - 1
+
+    if (i < matrix_dim) {
+        size_t target_config_component = 0;
+        // Construct the target qubit component of the index based on bits of 'i'
+        for (unsigned k = 0; k < m; ++k) {
+            if (((i >> k) & 1)) { // If k-th bit of 'i' is 1
+                target_config_component |= (1ULL << targetQubitIndices_gpu[k]);
+            }
+        }
+        d_out_contiguous[i] = d_in_strided[base_idx_non_targets | target_config_component];
+    }
+}
+
+// Refined Scatter Kernel:
+// Scatters 2^m elements for a *single* specified configuration of non-target qubits.
+// Launched with matrix_dim threads.
+// base_idx_non_targets: The component of the index determined by the fixed state of non-target qubits for this specific scatter op.
+__global__ void scatter_elements_kernel_v2(
+    rocComplex* d_out_strided,              // Output: Full state vector (size 2^N)
+    const rocComplex* d_in_contiguous,      // Input: Contiguous buffer of size 2^m (matrix_dim)
+    const unsigned* targetQubitIndices_gpu, // m target qubit indices (on GPU, assumed sorted)
+    unsigned m,                             // Number of target qubits
+    size_t base_idx_non_targets) {          // Index component from non-target qubits
+
+    unsigned matrix_dim = 1U << m;
+    unsigned i = threadIdx.x + blockIdx.x * blockDim.x; // i from 0 to matrix_dim - 1
+
+    if (i < matrix_dim) {
+        size_t target_config_component = 0;
+        // Construct the target qubit component of the index based on bits of 'i'
+        for (unsigned k = 0; k < m; ++k) {
+            if (((i >> k) & 1)) { // If k-th bit of 'i' is 1
+                target_config_component |= (1ULL << targetQubitIndices_gpu[k]);
+            }
+        }
+        d_out_strided[base_idx_non_targets | target_config_component] = d_in_contiguous[i];
+    }
+}

@@ -103,6 +103,79 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
                           int* outcome,
                           double* probability);
 
+// --- Single Qubit Specific Gates ---
+
+/**
+ * @brief Applies a Pauli-X gate to the target qubit.
+ */
+rocqStatus_t rocsvApplyX(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit);
+
+/**
+ * @brief Applies a Pauli-Y gate to the target qubit.
+ */
+rocqStatus_t rocsvApplyY(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit);
+
+/**
+ * @brief Applies a Pauli-Z gate to the target qubit.
+ */
+rocqStatus_t rocsvApplyZ(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit);
+
+/**
+ * @brief Applies a Hadamard gate to the target qubit.
+ */
+rocqStatus_t rocsvApplyH(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit);
+
+/**
+ * @brief Applies a Phase (S) gate to the target qubit.
+ */
+rocqStatus_t rocsvApplyS(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit);
+
+/**
+ * @brief Applies a T gate to the target qubit.
+ */
+rocqStatus_t rocsvApplyT(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit);
+
+/**
+ * @brief Applies an Rx rotation gate to the target qubit.
+ * @param theta Rotation angle in radians.
+ */
+rocqStatus_t rocsvApplyRx(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit, double theta);
+
+/**
+ * @brief Applies an Ry rotation gate to the target qubit.
+ * @param theta Rotation angle in radians.
+ */
+rocqStatus_t rocsvApplyRy(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit, double theta);
+
+/**
+ * @brief Applies an Rz rotation gate to the target qubit.
+ * @param theta Rotation angle in radians.
+ */
+rocqStatus_t rocsvApplyRz(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit, double theta);
+
+// --- Two Qubit Specific Gates ---
+
+/**
+ * @brief Applies a CNOT (Controlled-NOT) gate.
+ * @param controlQubit The control qubit index.
+ * @param targetQubit The target qubit index.
+ */
+rocqStatus_t rocsvApplyCNOT(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned controlQubit, unsigned targetQubit);
+
+/**
+ * @brief Applies a CZ (Controlled-Z) gate.
+ * @param qubit1 Index of the first qubit.
+ * @param qubit2 Index of the second qubit.
+ */
+rocqStatus_t rocsvApplyCZ(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned qubit1, unsigned qubit2);
+
+/**
+ * @brief Applies a SWAP gate between two qubits.
+ * @param qubit1 Index of the first qubit.
+ * @param qubit2 Index of the second qubit.
+ */
+rocqStatus_t rocsvApplySWAP(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned qubit1, unsigned qubit2);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
