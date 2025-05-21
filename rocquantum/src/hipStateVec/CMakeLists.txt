@@ -21,8 +21,73 @@ target_link_libraries(hipStateVec PUBLIC
     hiprand::hiprand # Provided by find_package(hiprand)
 )
 
+# Find RCCL package (try common names)
+find_package(rccl QUIET)
+if(NOT rccl_FOUND)
+  find_package(RCCL QUIET)
+  if(NOT RCCL_FOUND)
+    find_package(Hccl REQUIRED) # If Hccl is the one, make it required
+    set(rccl_INCLUDE_DIRS ${Hccl_INCLUDE_DIRS})
+    set(rccl_LIBRARIES ${Hccl_LIBRARIES})
+    set(rccl_FOUND TRUE) # Assume Hccl implies rccl for our purposes
+  else()
+    set(rccl_INCLUDE_DIRS ${RCCL_INCLUDE_DIRS})
+    set(rccl_LIBRARIES ${RCCL_LIBRARIES})
+  endif()
+elseif(rccl_FOUND)
+  # If rccl_FOUND by find_package(rccl), variables should be rccl_INCLUDE_DIRS and rccl_LIBRARIES
+  # If using modern CMake, rccl::rccl might be an imported target.
+  # For now, assume variables are set.
+endif()
+
+if(rccl_FOUND)
+  message(STATUS "RCCL/Hccl found.")
+  if(rccl_INCLUDE_DIRS)
+    target_include_directories(hipStateVec PUBLIC ${rccl_INCLUDE_DIRS})
+    message(STATUS "RCCL include dirs: ${rccl_INCLUDE_DIRS}")
+  endif()
+  if(rccl_LIBRARIES)
+    target_link_libraries(hipStateVec PUBLIC ${rccl_LIBRARIES})
+    message(STATUS "RCCL libraries: ${rccl_LIBRARIES}")
+  elseif(TARGET rccl::rccl) # Check for imported target
+     target_link_libraries(hipStateVec PUBLIC rccl::rccl)
+     message(STATUS "Linking against RCCL imported target rccl::rccl.")
+  else()
+     message(WARNING "RCCL found but no library path or imported target (rccl_LIBRARIES or rccl::rccl) defined.")
+  endif()
+else()
+  message(FATAL_ERROR "RCCL (or Hccl) package not found. Please ensure it is installed and discoverable by CMake.")
+endif()
+
+
 # Set install rules if you plan to install the library
 # install(TARGETS hipStateVec DESTINATION lib)
 # install(FILES ${PROJECT_SOURCE_DIR}/include/rocquantum/hipStateVec.h DESTINATION include/rocquantum)
 
 message(STATUS "hipStateVec library target created.")
+
+# --- Tests ---
+if(BUILD_TESTING)
+    find_package(GTest REQUIRED) # Assuming GTest is preferred, but simple main() is used in example.
+                                 # If not using GTest, this find_package is not strictly needed for the example.
+
+    add_executable(test_hipStateVec_multi_gpu test_hipStateVec_multi_gpu.cpp)
+    
+    # Link against the hipStateVec library itself (rocquantum_hipStateVec or hipStateVec)
+    # The target name for the library is 'hipStateVec' as defined in this CMakeLists.txt
+    # Also link against HIP runtime.
+    target_link_libraries(test_hipStateVec_multi_gpu PRIVATE 
+        hipStateVec 
+        HIP::hip_runtime
+        # GTest::gtest_main # If using GTest
+    )
+    # Ensure the test executable can find headers from the library.
+    # The hipStateVec target already has PUBLIC include to ../../include
+    # so test_hipStateVec_multi_gpu should inherit this.
+
+    # Enable CTest integration
+    include(CTest)
+    add_test(NAME MultiGPUTests COMMAND test_hipStateVec_multi_gpu)
+    
+    message(STATUS "Multi-GPU tests for hipStateVec added.")
+endif()

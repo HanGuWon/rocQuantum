@@ -19,7 +19,8 @@ typedef enum {
     ROCQ_STATUS_INVALID_VALUE = 2,
     ROCQ_STATUS_ALLOCATION_FAILED = 3,
     ROCQ_STATUS_HIP_ERROR = 4,
-    ROCQ_STATUS_NOT_IMPLEMENTED = 5
+    ROCQ_STATUS_NOT_IMPLEMENTED = 5,
+    ROCQ_STATUS_RCCL_ERROR = 6 // Ensure this is present
     // Add more specific error codes as needed
 } rocqStatus_t;
 
@@ -62,6 +63,64 @@ rocqStatus_t rocsvAllocateState(rocsvHandle_t handle, unsigned numQubits, rocCom
  * @return rocqStatus_t Status of the operation.
  */
 rocqStatus_t rocsvInitializeState(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits);
+
+/**
+ * @brief Allocates memory for a distributed state vector across multiple GPUs.
+ *
+ * The total number of qubits determines the global state vector size. This size is
+ * then divided among the available GPUs managed by the handle.
+ * Assumes numGpus in the handle is a power of 2.
+ *
+ * @param[in] handle The hipStateVec handle, assumed to be initialized for multi-GPU.
+ * @param[in] totalNumQubits The total number of qubits for the global state vector.
+ * @return rocqStatus_t Status of the operation.
+ */
+rocqStatus_t rocsvAllocateDistributedState(rocsvHandle_t handle, unsigned totalNumQubits);
+
+/**
+ * @brief Initializes a distributed state vector to the |0...0> state.
+ *
+ * This function assumes rocsvAllocateDistributedState has been successfully called.
+ * It sets all amplitudes to zero across all GPU slices, then sets the first amplitude
+ * (global index 0, on GPU 0) to 1.0.
+ *
+ * @param[in] handle The hipStateVec handle managing the distributed state.
+ * @return rocqStatus_t Status of the operation.
+ */
+rocqStatus_t rocsvInitializeDistributedState(rocsvHandle_t handle);
+
+/**
+ * @brief Applies a pre-fused 2x2 matrix to a single target qubit.
+ *
+ * The matrix represents a sequence of single-qubit gates that have already been
+ * multiplied together on the CPU.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @param[in] targetQubit The global index of the qubit the fused gate acts upon.
+ * @param[in] d_fusedMatrix Pointer to the 2x2 gate matrix (DEVICE memory, column-major).
+ *                          The matrix must be unitary.
+ * @return rocqStatus_t Status of the operation.
+ */
+rocqStatus_t rocsvApplyFusedSingleQubitMatrix(rocsvHandle_t handle,
+                                              unsigned targetQubit,
+                                              const rocComplex* d_fusedMatrix);
+
+/**
+ * @brief Swaps the roles of two qubit indices in the state vector representation,
+ *        potentially requiring data exchange between GPUs if a global slice qubit is involved.
+ *
+ * This is used to make non-local qubits local for gate application.
+ * The state vector is modified in place.
+ * Assumes temporary swap buffers are managed by the handle.
+ *
+ * @param[in] handle The hipStateVec handle, managing all GPU resources.
+ * @param[in] qubit_idx1 First global qubit index to swap.
+ * @param[in] qubit_idx2 Second global qubit index to swap.
+ * @return rocqStatus_t Status of the operation.
+ */
+rocqStatus_t rocsvSwapIndexBits(rocsvHandle_t handle,
+                                unsigned qubit_idx1,
+                                unsigned qubit_idx2);
 
 /**
  * @brief Applies a quantum gate (matrix) to the specified qubits in the state vector.
