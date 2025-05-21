@@ -1279,6 +1279,23 @@ static inline size_t rocquant_swap_bits_in_value(size_t value, unsigned bit_pos1
     return value;
 }
 
+// Forward declarations for kernels defined in swap_kernels.hip
+// These are illustrative; actual linkage might require extern "C" if swap_kernels.hip is compiled as C.
+// However, HIP typically handles this if both are compiled with hipcc.
+__global__ void calculate_swap_counts_kernel(
+    size_t local_slice_num_elements, unsigned qubit_idx1_global, unsigned qubit_idx2_global,
+    unsigned num_local_qubits_per_gpu, int source_gpu_rank, int* d_send_counts_for_source_gpu);
+
+__global__ void shuffle_data_for_swap_kernel(
+    const rocComplex* local_slice_data_in, size_t local_slice_num_elements,
+    unsigned qubit_idx1_global, unsigned qubit_idx2_global, unsigned num_local_qubits_per_gpu,
+    int source_gpu_rank, const int* d_send_displacements_for_source_gpu,
+    rocComplex* d_packed_send_buffer_out, int* d_output_buffer_atomic_counters);
+
+__global__ void local_bit_swap_permutation_kernel(
+    rocComplex* d_local_slice, rocComplex* d_temp_buffer_for_slice, size_t local_slice_num_elements,
+    unsigned local_qubit_idx1, unsigned local_qubit_idx2);
+
 
 rocqStatus_t rocsvSwapIndexBits(rocsvHandle_t handle,
                                 unsigned qubit_idx1,
@@ -1411,6 +1428,21 @@ static inline size_t rocquant_swap_bits_in_value(size_t value, unsigned bit_pos1
     }
     return value;
 }
+
+// Forward declarations for kernels from swap_kernels.hip
+__global__ void calculate_swap_counts_kernel(
+    size_t local_slice_num_elements, unsigned qubit_idx1_global, unsigned qubit_idx2_global,
+    unsigned num_local_qubits_per_gpu, int source_gpu_rank, int* d_send_counts_for_source_gpu);
+
+__global__ void shuffle_data_for_swap_kernel(
+    const rocComplex* local_slice_data_in, size_t local_slice_num_elements,
+    unsigned qubit_idx1_global, unsigned qubit_idx2_global, unsigned num_local_qubits_per_gpu,
+    int source_gpu_rank, const int* d_send_displacements_for_source_gpu,
+    rocComplex* d_packed_send_buffer_out, int* d_output_buffer_atomic_counters);
+
+__global__ void local_bit_swap_permutation_kernel(
+    rocComplex* d_local_slice, rocComplex* d_temp_buffer_for_slice, size_t local_slice_num_elements,
+    unsigned local_qubit_idx1, unsigned local_qubit_idx2);
 
 
 rocqStatus_t rocsvSwapIndexBits(rocsvHandle_t handle,
@@ -1595,6 +1627,21 @@ static inline size_t rocquant_swap_bits_in_value(size_t value, unsigned bit_pos1
     }
     return value;
 }
+
+// Forward declarations for kernels from swap_kernels.hip
+__global__ void calculate_swap_counts_kernel(
+    size_t local_slice_num_elements, unsigned qubit_idx1_global, unsigned qubit_idx2_global,
+    unsigned num_local_qubits_per_gpu, int source_gpu_rank, int* d_send_counts_for_source_gpu);
+
+__global__ void shuffle_data_for_swap_kernel(
+    const rocComplex* local_slice_data_in, size_t local_slice_num_elements,
+    unsigned qubit_idx1_global, unsigned qubit_idx2_global, unsigned num_local_qubits_per_gpu,
+    int source_gpu_rank, const int* d_send_displacements_for_source_gpu,
+    rocComplex* d_packed_send_buffer_out, int* d_output_buffer_atomic_counters);
+
+__global__ void local_bit_swap_permutation_kernel(
+    rocComplex* d_local_slice, rocComplex* d_temp_buffer_for_slice, size_t local_slice_num_elements,
+    unsigned local_qubit_idx1, unsigned local_qubit_idx2);
 
 
 rocqStatus_t rocsvSwapIndexBits(rocsvHandle_t handle,
@@ -1794,6 +1841,21 @@ static inline size_t rocquant_swap_bits_in_value(size_t value, unsigned bit_pos1
     return value;
 }
 
+// Forward declarations for kernels from swap_kernels.hip
+__global__ void calculate_swap_counts_kernel(
+    size_t local_slice_num_elements, unsigned qubit_idx1_global, unsigned qubit_idx2_global,
+    unsigned num_local_qubits_per_gpu, int source_gpu_rank, int* d_send_counts_for_source_gpu);
+
+__global__ void shuffle_data_for_swap_kernel(
+    const rocComplex* local_slice_data_in, size_t local_slice_num_elements,
+    unsigned qubit_idx1_global, unsigned qubit_idx2_global, unsigned num_local_qubits_per_gpu,
+    int source_gpu_rank, const int* d_send_displacements_for_source_gpu,
+    rocComplex* d_packed_send_buffer_out, int* d_output_buffer_atomic_counters);
+
+__global__ void local_bit_swap_permutation_kernel(
+    rocComplex* d_local_slice, rocComplex* d_temp_buffer_for_slice, size_t local_slice_num_elements,
+    unsigned local_qubit_idx1, unsigned local_qubit_idx2);
+
 
 rocqStatus_t rocsvSwapIndexBits(rocsvHandle_t handle,
                                 unsigned qubit_idx1,
@@ -1987,6 +2049,21 @@ static inline size_t swap_bits_in_value(size_t value, unsigned bit_pos1, unsigne
     }
     return value;
 }
+
+// Forward declarations for kernels from swap_kernels.hip
+__global__ void calculate_swap_counts_kernel(
+    size_t local_slice_num_elements, unsigned qubit_idx1_global, unsigned qubit_idx2_global,
+    unsigned num_local_qubits_per_gpu, int source_gpu_rank, int* d_send_counts_for_source_gpu);
+
+__global__ void shuffle_data_for_swap_kernel(
+    const rocComplex* local_slice_data_in, size_t local_slice_num_elements,
+    unsigned qubit_idx1_global, unsigned qubit_idx2_global, unsigned num_local_qubits_per_gpu,
+    int source_gpu_rank, const int* d_send_displacements_for_source_gpu,
+    rocComplex* d_packed_send_buffer_out, int* d_output_buffer_atomic_counters);
+
+__global__ void local_bit_swap_permutation_kernel(
+    rocComplex* d_local_slice, rocComplex* d_temp_buffer_for_slice, size_t local_slice_num_elements,
+    unsigned local_qubit_idx1, unsigned local_qubit_idx2);
 
 
 rocqStatus_t rocsvSwapIndexBits(rocsvHandle_t handle,
