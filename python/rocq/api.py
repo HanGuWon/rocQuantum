@@ -61,108 +61,139 @@ class Circuit:
     Represents a quantum circuit and provides methods to build and simulate it
     using the hipStateVec backend.
     """
-    def __init__(self, num_qubits: int, simulator: Simulator):
+    def __init__(self, num_qubits: int, simulator: Simulator, multi_gpu: bool = False):
         if not isinstance(simulator, Simulator):
             raise TypeError("A valid Simulator instance is required.")
-        if num_qubits <= 0:
-            raise ValueError("Number of qubits must be positive.")
+        if num_qubits < 0: # Allow 0 qubits for 1-element state vector
+            raise ValueError("Number of qubits must be non-negative.")
 
         self.num_qubits = num_qubits
         self.simulator = simulator
         self._sim_handle = simulator._handle_wrapper # Get the C++ handle wrapper
+        self.is_multi_gpu = multi_gpu
+        self._d_state_buffer = None # Will be None for multi-GPU
 
         try:
-            # allocate_state_internal returns an owning DeviceBuffer
-            self._d_state_buffer = backend.allocate_state_internal(self._sim_handle, self.num_qubits)
-            status = backend.initialize_state(self._sim_handle, self._d_state_buffer, self.num_qubits)
-            if status != backend.rocqStatus.SUCCESS:
-                raise RuntimeError(f"Failed to initialize state: {status}")
+            if self.is_multi_gpu:
+                if num_qubits == 0 and self.simulator.handle.get_num_gpus() > 1:
+                     raise ValueError("Cannot create a 0-qubit distributed state across multiple GPUs. Use single GPU mode or at least log2(num_gpus) qubits.")
+                backend.allocate_distributed_state(self._sim_handle, self.num_qubits)
+                backend.initialize_distributed_state(self._sim_handle)
+                # For multi-GPU, _d_state_buffer remains None as state is managed by handle
+            else:
+                # allocate_state_internal returns an owning DeviceBuffer
+                self._d_state_buffer = backend.allocate_state_internal(self._sim_handle, self.num_qubits)
+                status = backend.initialize_state(self._sim_handle, self._d_state_buffer, self.num_qubits)
+                if status != backend.rocqStatus.SUCCESS:
+                    raise RuntimeError(f"Failed to initialize state: {status}")
+
             self.simulator._active_circuits +=1
         except RuntimeError as e:
-            # If d_state_buffer was allocated but initialize failed, it will be auto-freed by DeviceBuffer destructor
-            # if self._d_state_buffer was assigned.
             print(f"Error during Circuit initialization: {e}")
             raise
             
     def __del__(self):
-        # The self._d_state_buffer (DeviceBuffer) will automatically call hipFree 
-        # in its C++ destructor when this Circuit object is garbage collected.
+        # self._d_state_buffer (if not None) will be auto-freed by its C++ destructor
         if hasattr(self, 'simulator') and self.simulator is not None and hasattr(self.simulator, '_active_circuits'):
-             self.simulator._active_circuits -=1
-        # print(f"Circuit for {self.num_qubits} qubits being deleted.") # For debug
+             if self.simulator._active_circuits > 0 : # Ensure it doesn't go negative
+                self.simulator._active_circuits -=1
+        # print(f"Circuit for {self.num_qubits} qubits (multi_gpu={self.is_multi_gpu}) being deleted.") # For debug
+
+    def _get_d_state_for_backend(self) -> backend.DeviceBuffer:
+        """Returns the appropriate DeviceBuffer for backend calls."""
+        if self.is_multi_gpu:
+            # For multi-GPU calls, the C-API functions often have a legacy d_state parameter.
+            # The actual distributed state is within the handle. We pass a default (null) DeviceBuffer.
+            # The C++ side should primarily use handle->d_local_state_slices in multi-GPU mode.
+            return backend.DeviceBuffer()
+        return self._d_state_buffer
 
     def _validate_qubit_index(self, qubit_index, name="target qubit"):
         if not isinstance(qubit_index, int) or not (0 <= qubit_index < self.num_qubits):
-            raise ValueError(
-                f"{name} index {qubit_index} is out of range for {self.num_qubits} qubits."
-            )
+            # Allow target qubit 0 for a 0-qubit system (which has 1 state).
+            if not (self.num_qubits == 0 and qubit_index == 0):
+                 raise ValueError(
+                    f"{name} index {qubit_index} is out of range for {self.num_qubits} qubits."
+                )
 
     def _validate_control_target(self, control_qubit, target_qubit):
         self._validate_qubit_index(control_qubit, "control qubit")
         self._validate_qubit_index(target_qubit, "target qubit")
-        if control_qubit == target_qubit:
+        if control_qubit == target_qubit and self.num_qubits > 0 : # For 0 qubits, c=t=0 is only option
             raise ValueError("Control and target qubits cannot be the same.")
 
     # --- Single-Qubit Gates ---
     def x(self, target_qubit: int):
         self._validate_qubit_index(target_qubit)
-        status = backend.apply_x(self._sim_handle, self._d_state_buffer, self.num_qubits, target_qubit)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_x(self._sim_handle, d_state_arg, self.num_qubits, target_qubit)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply X failed: {status}")
 
     def y(self, target_qubit: int):
         self._validate_qubit_index(target_qubit)
-        status = backend.apply_y(self._sim_handle, self._d_state_buffer, self.num_qubits, target_qubit)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_y(self._sim_handle, d_state_arg, self.num_qubits, target_qubit)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply Y failed: {status}")
 
     def z(self, target_qubit: int):
         self._validate_qubit_index(target_qubit)
-        status = backend.apply_z(self._sim_handle, self._d_state_buffer, self.num_qubits, target_qubit)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_z(self._sim_handle, d_state_arg, self.num_qubits, target_qubit)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply Z failed: {status}")
 
     def h(self, target_qubit: int):
         self._validate_qubit_index(target_qubit)
-        status = backend.apply_h(self._sim_handle, self._d_state_buffer, self.num_qubits, target_qubit)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_h(self._sim_handle, d_state_arg, self.num_qubits, target_qubit)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply H failed: {status}")
 
     def s(self, target_qubit: int):
         self._validate_qubit_index(target_qubit)
-        status = backend.apply_s(self._sim_handle, self._d_state_buffer, self.num_qubits, target_qubit)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_s(self._sim_handle, d_state_arg, self.num_qubits, target_qubit)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply S failed: {status}")
 
     def t(self, target_qubit: int):
         self._validate_qubit_index(target_qubit)
-        status = backend.apply_t(self._sim_handle, self._d_state_buffer, self.num_qubits, target_qubit)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_t(self._sim_handle, d_state_arg, self.num_qubits, target_qubit)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply T failed: {status}")
 
     def rx(self, angle: float, target_qubit: int):
         self._validate_qubit_index(target_qubit)
-        status = backend.apply_rx(self._sim_handle, self._d_state_buffer, self.num_qubits, target_qubit, angle)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_rx(self._sim_handle, d_state_arg, self.num_qubits, target_qubit, angle)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply Rx failed: {status}")
 
     def ry(self, angle: float, target_qubit: int):
         self._validate_qubit_index(target_qubit)
-        status = backend.apply_ry(self._sim_handle, self._d_state_buffer, self.num_qubits, target_qubit, angle)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_ry(self._sim_handle, d_state_arg, self.num_qubits, target_qubit, angle)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply Ry failed: {status}")
 
     def rz(self, angle: float, target_qubit: int):
         self._validate_qubit_index(target_qubit)
-        status = backend.apply_rz(self._sim_handle, self._d_state_buffer, self.num_qubits, target_qubit, angle)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_rz(self._sim_handle, d_state_arg, self.num_qubits, target_qubit, angle)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply Rz failed: {status}")
 
     # --- Two-Qubit Gates ---
     def cx(self, control_qubit: int, target_qubit: int): # CNOT
         self._validate_control_target(control_qubit, target_qubit)
-        status = backend.apply_cnot(self._sim_handle, self._d_state_buffer, self.num_qubits, control_qubit, target_qubit)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_cnot(self._sim_handle, d_state_arg, self.num_qubits, control_qubit, target_qubit)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply CNOT failed: {status}")
 
     def cz(self, qubit1: int, qubit2: int):
-        self._validate_control_target(qubit1, qubit2) # Same validation applies
-        status = backend.apply_cz(self._sim_handle, self._d_state_buffer, self.num_qubits, qubit1, qubit2)
+        self._validate_control_target(qubit1, qubit2)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_cz(self._sim_handle, d_state_arg, self.num_qubits, qubit1, qubit2)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply CZ failed: {status}")
 
     def swap(self, qubit1: int, qubit2: int):
-        self._validate_control_target(qubit1, qubit2) # Same validation applies
-        status = backend.apply_swap(self._sim_handle, self._d_state_buffer, self.num_qubits, qubit1, qubit2)
+        self._validate_control_target(qubit1, qubit2)
+        d_state_arg = self._get_d_state_for_backend()
+        status = backend.apply_swap(self._sim_handle, d_state_arg, self.num_qubits, qubit1, qubit2)
         if status != backend.rocqStatus.SUCCESS: raise RuntimeError(f"Apply SWAP failed: {status}")
 
     # --- Generic Unitary ---
@@ -194,11 +225,12 @@ class Circuit:
 
         # Python side creates a device matrix using the Simulator's helper
         device_matrix_buffer = self.simulator.create_device_matrix(matrix)
+        d_state_arg = self._get_d_state_for_backend()
         
         try:
             status = backend.apply_matrix(
                 self._sim_handle, 
-                self._d_state_buffer, 
+                d_state_arg,
                 self.num_qubits,
                 qubit_indices,          # Pybind11 should handle list[int] to std::vector<unsigned>
                 device_matrix_buffer,   # Pass the DeviceBuffer object
@@ -207,9 +239,7 @@ class Circuit:
             if status != backend.rocqStatus.SUCCESS:
                 raise RuntimeError(f"Apply Matrix failed: {status}")
         finally:
-            # device_matrix_buffer will be auto-freed by its C++ destructor
-            # when it goes out of scope in Python if it was created here.
-            # No explicit free needed if using the RAII DeviceBuffer from bindings.
+            # device_matrix_buffer is an RAII object and will be freed when it goes out of scope.
             pass
 
 
@@ -227,9 +257,13 @@ class Circuit:
                                and the probability of that outcome.
         """
         self._validate_qubit_index(qubit_to_measure)
+        d_state_arg = self._get_d_state_for_backend()
         try:
+            # The numQubits passed to backend.measure should be the total number of qubits in the system
+            # which is self.num_qubits. The C++ backend will use this along with the handle
+            # to determine local qubit counts if it's a multi-GPU measurement.
             outcome, probability = backend.measure(
-                self._sim_handle, self._d_state_buffer, self.num_qubits, qubit_to_measure
+                self._sim_handle, d_state_arg, self.num_qubits, qubit_to_measure
             )
             return outcome, probability
         except RuntimeError as e:
@@ -246,8 +280,6 @@ class Circuit:
     #     # This could collect measurement statistics over multiple shots.
     #     if shots == 1: # For compatibility with a potential future API
     #        print("Warning: 'run' method called with shots=1. Operations are applied eagerly. Consider using 'measure'.")
-    #        # Or, if a final measurement is implied:
-    #        # return self.measure_all() # if such a function exists
     #     raise NotImplementedError("'run' method with shots is not fully implemented for this eager execution model.")
 
 ```

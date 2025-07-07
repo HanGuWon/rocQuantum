@@ -109,6 +109,83 @@ def main():
         print("or probabilities, or sample multiple shots from the final state without intermediate collapse.")
         print("The current 'measure' method is destructive.")
 
+        # --- Multi-GPU Test Section ---
+        print("\n--- Starting Multi-GPU Test Section (expect NOT_IMPLEMENTED for global ops) ---")
+        num_gpus_available = 0
+        try:
+            # A bit of a hack to get num_gpus without exposing it directly in Simulator if not already there
+            # This assumes the handle in C++ gets numGpus set. If rocq.Simulator().handle.get_num_gpus() exists.
+            # For now, we'll just try to run it. If it's < 2 GPUs, some tests might not be meaningful for distribution.
+            # Let's assume we have at least 1 GPU from previous tests.
+            # A proper way would be sim.get_num_gpus() or similar.
+            pass
+        except Exception:
+            pass # Ignore if we can't get num_gpus easily
+
+        # Test multi-GPU allocation and local operations
+        # Requires enough qubits to ensure numLocalQubitsPerGpu > 0 for meaningful local ops test,
+        # e.g. if 2 GPUs, numGlobalSliceQubits=1. If total=3, numLocal=2.
+        # If total=1, numLocal=0 for 2 GPUs, which is a valid but perhaps less interesting test for local gates.
+
+        # Let's use a number of qubits that might require distribution if multiple GPUs are present.
+        # For example, if 2 GPUs, log2(2)=1 slice qubit. For 3 total qubits, 2 are local.
+        # If 4 GPUs, log2(4)=2 slice qubits. For 3 total qubits, 1 is local.
+        # If 1 GPU, all 3 are local.
+
+        multi_gpu_num_qubits = 3
+        print(f"\nAttempting to create a {multi_gpu_num_qubits}-qubit circuit in multi-GPU mode...")
+        try:
+            # This will use rocsvAllocateDistributedState and rocsvInitializeDistributedState
+            circuit_mgpu = rocq.Circuit(num_qubits=multi_gpu_num_qubits, simulator=sim, multi_gpu=True)
+            print(f"Multi-GPU circuit created for {multi_gpu_num_qubits} qubits.")
+
+            # Test some local operations.
+            # Assuming numLocalQubitsPerGpu >= 1 for these to be meaningful.
+            # If numLocalQubitsPerGpu is 0 (e.g. 1 qubit total, 2 GPUs), these will target q0,
+            # which might be a slice bit depending on exact mapping.
+            # The `are_qubits_local` check in C++ is key.
+            # For qubit 0 to be local, numLocalQubitsPerGpu must be at least 1.
+            # If numLocalQubitsPerGpu = 2 (e.g. 3 total, 2 GPUs), q0 and q1 are local.
+
+            print("Applying H to qubit 0 (local op if numLocalQubitsPerGpu >= 1)...")
+            circuit_mgpu.h(0)
+            print("- Applied H to qubit 0.")
+
+            if multi_gpu_num_qubits >= 2:
+                print("Applying CX to control=0, target=1 (local op if numLocalQubitsPerGpu >= 2)...")
+                circuit_mgpu.cx(0, 1)
+                print("- Applied CX to control=0, target=1.")
+
+            print("Attempting measurement on qubit 0 (multi-GPU)...")
+            # This will test the new multi-GPU measurement path if qubit 0 is local.
+            # If qubit 0 is a slice bit (e.g. 1 total qubit, 2 GPUs, numLocal=0), this should hit NOT_IMPLEMENTED
+            # in the C++ rocsvMeasure before specific kernel logic.
+            try:
+                mgpu_q0_outcome, mgpu_q0_prob = circuit_mgpu.measure(0)
+                print(f"- Multi-GPU: Measured qubit 0: outcome = {mgpu_q0_outcome}, probability = {mgpu_q0_prob:.4f}")
+            except RuntimeError as e_meas:
+                print(f"- Multi-GPU measure(0) failed: {e_meas}")
+
+
+            # Test a global operation that would require rocsvSwapIndexBits
+            if multi_gpu_num_qubits >= 2:
+                # Example: if numGpus=2, numLocalQubits=multi_gpu_num_qubits-1.
+                # If multi_gpu_num_qubits=2, then numLocalQubits=1. Qubit 1 is a slice bit.
+                # CNOT(0,1) where q0 is local and q1 is slice bit would need swap.
+                # The current apply_cnot C++ code returns NOT_IMPLEMENTED if not are_qubits_local.
+                print("Attempting CX(0, N-1) which might be a global operation...")
+                try:
+                    circuit_mgpu.cx(0, multi_gpu_num_qubits -1) # This might fail if not local
+                    print(f"- Applied CX(0, {multi_gpu_num_qubits-1})")
+                except RuntimeError as e_global:
+                    print(f"- CX(0, {multi_gpu_num_qubits-1}) failed as expected for global op: {e_global}")
+
+        except ValueError as ve:
+            print(f"ValueError during multi-GPU circuit creation/operation: {ve}")
+        except RuntimeError as e_mgpu:
+            print(f"RuntimeError during multi-GPU circuit creation/operation: {e_mgpu}")
+        print("--- Multi-GPU Test Section Finished ---")
+
 
     except RuntimeError as e:
         print(f"An error occurred: {e}")
