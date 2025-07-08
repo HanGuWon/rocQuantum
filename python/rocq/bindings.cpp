@@ -278,15 +278,170 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
     m.def("create_device_matrix_from_numpy",
         [](py::array_t<rocComplex, py::array::c_style | py::array::forcecast> np_array) {
             if (np_array.ndim() != 2) throw std::runtime_error("NumPy array must be 2D for matrix.");
-            // For this simple version, assume square matrix.
-            // size_t rows = np_array.shape(0);
-            // size_t cols = np_array.shape(1);
-            // if (rows != cols) throw std::runtime_error("Matrix must be square.");
-            
             size_t num_elements = np_array.size();
-            DeviceBuffer db(num_elements, sizeof(rocComplex));
+            DeviceBuffer db(num_elements, sizeof(rocComplex)); // Owns memory
             db.copy_from_numpy(np_array);
             return db;
         }, py::arg("numpy_array"), "Creates a DeviceBuffer and copies a NumPy array to it.");
+
+    // --- rocTensorUtil Bindings ---
+    py::class_<rocquantum::util::rocTensor>(m, "RocTensor")
+        .def(py::init<>(), "Default constructor")
+        .def(py::init([](const std::vector<long long>& dims, py::object py_data_np_array) {
+            // This constructor is primarily for Python-side creation of metadata.
+            // Actual device data allocation should be done via allocate_tensor.
+            // If py_data_np_array is a numpy array, we could try to initialize from it,
+            // but that complicates ownership. For now, primarily for dimensions.
+            auto tensor = rocquantum::util::rocTensor();
+            tensor.dimensions_ = dims;
+            tensor.calculate_strides(); // Calculate strides based on dimensions
+            // Data pointer (tensor.data_) should be set via allocate_tensor or by wrapping existing device memory.
+            // tensor.owned_ will be set by allocate_tensor.
+            return tensor;
+        }), py::arg("dimensions"), py::arg("py_data_np_array") = py::none(), "Constructor with dimensions. Data must be set via allocate_tensor or from existing buffer.")
+        .def_property("dimensions",
+            [](const rocquantum::util::rocTensor &self) { return self.dimensions_; },
+            [](rocquantum::util::rocTensor &self, const std::vector<long long>& dims) {
+                self.dimensions_ = dims;
+                self.calculate_strides(); // Recalculate strides when dimensions change
+            })
+        .def_property("labels",
+            [](const rocquantum::util::rocTensor &self) { return self.labels_; },
+            [](rocquantum::util::rocTensor &self, const std::vector<std::string>& lbls) { self.labels_ = lbls; })
+        .def_property_readonly("strides", [](const rocquantum::util::rocTensor &self) { return self.strides_; })
+        .def("get_element_count", &rocquantum::util::rocTensor::get_element_count)
+        .def("rank", &rocquantum::util::rocTensor::rank)
+        // Note: data_ pointer is not directly exposed for safety.
+        // owned_ flag is also not directly exposed, managed by allocate/free.
+        .def("__repr__", [](const rocquantum::util::rocTensor &t) {
+            std::string rep = "<rocq.RocTensor dimensions=[";
+            for (size_t i = 0; i < t.dimensions_.size(); ++i) {
+                rep += std::to_string(t.dimensions_[i]) + (i == t.dimensions_.size() - 1 ? "" : ", ");
+            }
+            rep += "], rank=" + std::to_string(t.rank());
+            rep += ", elements=" + std::to_string(t.get_element_count());
+            rep += (t.data_ ? ", has_data" : ", no_data");
+            rep += (t.owned_ ? ", owned" : ", view");
+            rep += ">";
+            return rep;
+        });
+
+    m.def("allocate_tensor", [](rocquantum::util::rocTensor& tensor) {
+        // This function will modify tensor in-place to allocate its data
+        rocqStatus_t status = rocquantum::util::rocTensorAllocate(&tensor);
+        if (status != ROCQ_STATUS_SUCCESS) {
+            throw std::runtime_error("rocTensorAllocate failed: " + std::to_string(status));
+        }
+        // The tensor passed by reference is modified (data_ pointer set, owned_ set to true)
+    }, py::arg("tensor").noconvert(), "Allocates device memory for the given RocTensor object (modifies in-place).");
+
+    m.def("free_tensor", [](rocquantum::util::rocTensor& tensor) {
+        rocqStatus_t status = rocquantum::util::rocTensorFree(&tensor);
+        if (status != ROCQ_STATUS_SUCCESS) {
+            // Perhaps just warn or log if freeing non-owned/null data,
+            // but rocTensorFree should handle this gracefully.
+            // For now, any error from rocTensorFree is an exception.
+            throw std::runtime_error("rocTensorFree failed: " + std::to_string(status));
+        }
+        // Tensor is modified in-place (data_ to nullptr, owned_ to false)
+    }, py::arg("tensor").noconvert(), "Frees device memory for the RocTensor if it's owned (modifies in-place).");
+
+    m.def("permute_tensor",
+        [](rocquantum::util::rocTensor& output_tensor,
+           const rocquantum::util::rocTensor& input_tensor,
+           const std::vector<int>& host_permutation_map) {
+        // Ensure output_tensor has its data_ pointer allocated and dimensions/strides set correctly by the caller
+        // before calling this. The rocTensorPermute C-function doesn't allocate for output.
+        if (!output_tensor.data_ && output_tensor.get_element_count() > 0) {
+            throw std::runtime_error("Output tensor for permute_tensor must be pre-allocated.");
+        }
+        rocqStatus_t status = rocquantum::util::rocTensorPermute(&output_tensor, &input_tensor, host_permutation_map);
+        if (status != ROCQ_STATUS_SUCCESS) {
+            throw std::runtime_error("rocTensorPermute failed: " + std::to_string(status));
+        }
+    }, py::arg("output_tensor").noconvert(), py::arg("input_tensor"), py::arg("permutation_map"));
+
+    // --- hipTensorNet Bindings ---
+    // Opaque handle wrapper for rocTensorNetworkHandle_t
+    class RocTensorNetworkHandleWrapper {
+    public:
+        rocTensorNetworkHandle_t handle_ = nullptr;
+        RocsvHandleWrapper& sim_handle_ref_; // Keep a reference to the simulator's handle for rocBLAS/stream
+
+        RocTensorNetworkHandleWrapper(RocsvHandleWrapper& sim_handle) : sim_handle_ref_(sim_handle) {
+            rocqStatus_t status = rocTensorNetworkCreate(&handle_);
+            if (status != ROCQ_STATUS_SUCCESS) {
+                throw std::runtime_error("Failed to create rocTensorNetworkHandle: " + std::to_string(status));
+            }
+        }
+        ~RocTensorNetworkHandleWrapper() {
+            if (handle_) {
+                rocTensorNetworkDestroy(handle_);
+            }
+        }
+        RocTensorNetworkHandleWrapper(const RocTensorNetworkHandleWrapper&) = delete;
+        RocTensorNetworkHandleWrapper& operator=(const RocTensorNetworkHandleWrapper&) = delete;
+        RocTensorNetworkHandleWrapper(RocTensorNetworkHandleWrapper&& other) noexcept
+            : handle_(other.handle_), sim_handle_ref_(other.sim_handle_ref_) {
+            other.handle_ = nullptr;
+        }
+        RocTensorNetworkHandleWrapper& operator=(RocTensorNetworkHandleWrapper&& other) noexcept {
+            if (this != &other) {
+                if (handle_) rocTensorNetworkDestroy(handle_);
+                handle_ = other.handle_;
+                // sim_handle_ref_ = other.sim_handle_ref_; // This is tricky with references for assignment.
+                                                         // For simplicity, ensure sim_handle_ref is const or handle lifetime carefully.
+                                                         // Or make it a shared_ptr if simulator handle can go out of scope.
+                                                         // For now, assume simulator outlives network handle.
+                other.handle_ = nullptr;
+            }
+            return *this;
+        }
+        rocTensorNetworkHandle_t get() const { return handle_; }
+        RocsvHandleWrapper& get_sim_handle() const { return sim_handle_ref_; }
+    };
+
+    py::class_<RocTensorNetworkHandleWrapper>(m, "RocTensorNetwork")
+        .def(py::init<RocsvHandleWrapper&>(), py::arg("simulator_handle"), "Creates a Tensor Network manager.")
+        .def("add_tensor", [](RocTensorNetworkHandleWrapper& self, const rocquantum::util::rocTensor& tensor) {
+            // The C API rocTensorNetworkAddTensor takes a const rocTensor*.
+            // pybind11 will pass the rocTensor object by value if not careful.
+            // We need to pass a pointer to the tensor object held by Python.
+            // However, the C++ TensorNetwork class copies the rocTensor metadata.
+            // So, passing by const reference to pybind, which then passes pointer to C API, is fine.
+            rocqStatus_t status = rocTensorNetworkAddTensor(self.get(), &tensor);
+            if (status != ROCQ_STATUS_SUCCESS) {
+                throw std::runtime_error("rocTensorNetworkAddTensor failed: " + std::to_string(status));
+            }
+            // TODO: Return tensor index? The C-API doesn't, but the C++ class does.
+            // For now, no return, user manages indices.
+        }, py::arg("tensor"))
+        .def("add_contraction", [](RocTensorNetworkHandleWrapper& self, int t_idx_a, int m_idx_a, int t_idx_b, int m_idx_b){
+            rocqStatus_t status = rocTensorNetworkAddContraction(self.get(), t_idx_a, m_idx_a, t_idx_b, m_idx_b);
+             if (status != ROCQ_STATUS_SUCCESS) {
+                throw std::runtime_error("rocTensorNetworkAddContraction failed: " + std::to_string(status));
+            }
+        }, py::arg("tensor_idx_a"), py::arg("mode_idx_a"), py::arg("tensor_idx_b"), py::arg("mode_idx_b"))
+        .def("contract", [](RocTensorNetworkHandleWrapper& self, rocquantum::util::rocTensor& result_tensor_py) {
+            // result_tensor_py must be allocated by Python user with expected final shape.
+            // The C++ contract function will fill its data.
+            if (!result_tensor_py.data_ && result_tensor_py.get_element_count() > 0) {
+                 throw std::runtime_error("Result tensor for contract must be pre-allocated (e.g., using rocq.allocate_tensor).");
+            }
+            // Get blas_handle and stream from the simulator handle stored in RocTensorNetworkHandleWrapper
+            rocblas_handle blas_h = self.get_sim_handle().get()->blasHandles[0]; // Assuming device 0 for now
+            hipStream_t stream = self.get_sim_handle().get()->streams[0];     // Assuming device 0 for now
+            // A proper multi-GPU tensor network would need more sophisticated handle/stream management.
+
+            rocqStatus_t status = rocTensorNetworkContract(self.get(), &result_tensor_py, blas_h, stream);
+            if (status != ROCQ_STATUS_SUCCESS && status != ROCQ_STATUS_NOT_IMPLEMENTED) {
+                throw std::runtime_error("rocTensorNetworkContract failed: " + std::to_string(status));
+            }
+            if (status == ROCQ_STATUS_NOT_IMPLEMENTED) {
+                // py::print("Warning: rocTensorNetworkContract is not fully implemented yet.");
+                throw std::runtime_error("rocTensorNetworkContract is not fully implemented yet. Status: " + std::to_string(status));
+            }
+            // result_tensor_py is modified in place by the C function if successful
+        }, py::arg("result_tensor").noconvert(), "Contracts the tensor network. Result tensor must be pre-allocated.");
 
 }
