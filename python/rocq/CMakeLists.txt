@@ -17,12 +17,15 @@ pybind11_add_module(_rocq_hip_backend # Module name
 # Link against the hipStateVec library
 # Assumes hipStateVec is a target defined in a parent CMake scope (e.g., in src/hipStateVec/CMakeLists.txt)
 # and that the root CMakeLists.txt has `add_subdirectory(src/hipStateVec)` before `add_subdirectory(python/rocq)`
-target_link_libraries(_rocq_hip_backend PRIVATE hipStateVec)
+target_link_libraries(_rocq_hip_backend PRIVATE
+    hipStateVec          # Corrected target name for the hipStateVec library
+    rocqsim_tensornet    # Link against the new tensor network library
+)
 
 # Add include directories
-# Include directory for hipStateVec API (hipStateVec.h)
+# Include directory for hipStateVec API (hipStateVec.h) and hipTensorNet API
 target_include_directories(_rocq_hip_backend PRIVATE
-    ${PROJECT_SOURCE_DIR}/include # For rocquantum/hipStateVec.h
+    ${PROJECT_SOURCE_DIR}/include # For rocquantum/*.h (covers both hipStateVec.h and hipTensorNet.h)
     # Pybind11 include directory is usually handled by pybind11_add_module or find_package(pybind11)
     # ${pybind11_INCLUDE_DIRS} # Explicitly if needed
 )

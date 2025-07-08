@@ -66,6 +66,7 @@ include_directories(
 )
 
 add_subdirectory(src/hipStateVec)
+add_subdirectory(src/hipTensorNet) # Add hipTensorNet component
 
 # Example for tests (can be expanded later)
 # enable_testing()
