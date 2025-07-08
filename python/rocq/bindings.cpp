@@ -179,6 +179,22 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
             return rocsvInitializeState(handle_wrapper.get(), d_state_buffer.get_ptr<rocComplex>(), numQubits);
         }, py::arg("handle"), py::arg("d_state_buffer"), py::arg("num_qubits"));
 
+    m.def("allocate_distributed_state",
+        [](RocsvHandleWrapper& handle_wrapper, unsigned totalNumQubits) {
+            rocqStatus_t status = rocsvAllocateDistributedState(handle_wrapper.get(), totalNumQubits);
+            if (status != ROCQ_STATUS_SUCCESS) {
+                throw std::runtime_error("rocsvAllocateDistributedState failed: " + std::to_string(status));
+            }
+        }, py::arg("handle"), py::arg("total_num_qubits"), "Allocates a distributed state vector across multiple GPUs.");
+
+    m.def("initialize_distributed_state",
+        [](RocsvHandleWrapper& handle_wrapper) {
+            rocqStatus_t status = rocsvInitializeDistributedState(handle_wrapper.get());
+            if (status != ROCQ_STATUS_SUCCESS) {
+                throw std::runtime_error("rocsvInitializeDistributedState failed: " + std::to_string(status));
+            }
+        }, py::arg("handle"), "Initializes a distributed state vector to the |0...0> state.");
+
     // Specific single-qubit gates
     m.def("apply_x", [](const RocsvHandleWrapper& h, DeviceBuffer& d_state, unsigned nQ, unsigned tQ) {
         return rocsvApplyX(h.get(), d_state.get_ptr<rocComplex>(), nQ, tQ); }, "Applies X gate");

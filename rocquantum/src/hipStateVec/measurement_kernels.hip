@@ -6,54 +6,49 @@
 // This is prob0. prob1 = 1.0 - prob0.
 // This kernel performs a reduction. It's a simplified version.
 // For high performance, a multi-stage reduction (e.g., using shared memory) is better.
+// THIS IS A PLACEHOLDER KERNEL LOGIC FOR PROBABILITY CALCULATION (SINGLE GPU CONTEXT)
+// DO NOT USE AS IS FOR A PRODUCTION SYSTEM DUE TO RACE CONDITIONS AND INCORRECT PARALLEL SUMMATION
+// if not using a proper reduction framework like rocThrust.
 __global__ void calculate_prob0_kernel(const rocComplex* state,
-                                       unsigned numQubits,
-                                       unsigned targetQubit,
+                                       unsigned numQubits, // Total qubits in this state vector (slice)
+                                       unsigned targetQubit, // Local index of target qubit in this slice
                                        double* d_prob0_sum) { // Device pointer for sum
     size_t N = 1ULL << numQubits;
-    size_t k = 1ULL << targetQubit; // Stride related to targetQubit
+    // size_t k = 1ULL << targetQubit; // Stride related to targetQubit
 
-    // Each thread processes one element and adds to a shared sum if it's a '0' state for targetQubit
-    // This is a naive sum, not a proper parallel reduction.
-    // A proper reduction would be needed for performance.
-    // For now, this illustrates the logic path. THIS WILL BE SLOW AND INCORRECT FOR PARALLEL EXECUTION.
-    // A real implementation would use shared memory for block-level reduction, then atomicAdd for global sum.
-    // Or, better, use rocThrust/hipThrust for reduction.
-
-    // THIS IS A PLACEHOLDER KERNEL LOGIC FOR PROBABILITY CALCULATION
-    // DO NOT USE AS IS FOR A PRODUCTION SYSTEM DUE TO RACE CONDITIONS AND INCORRECT PARALLEL SUMMATION
-    if (threadIdx.x == 0 && blockIdx.x == 0) { // HACK: Only one thread does the sum for now to avoid race
+    // HACK: Only one thread does the sum for now to avoid race for this placeholder
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
         double p0 = 0.0;
-        for (size_t i = 0; i < N; ++i) {
-            // Check if the targetQubit bit is 0 for state i
-            // (i / k) % 2 == 0  <-- this checks if the bit at targetQubit position is 0
-            if (((i >> targetQubit) & 1) == 0) {
-                p0 += (double)state[i].x * state[i].x + (double)state[i].y * state[i].y;
+        if (N > 0) { // Ensure state is not empty (e.g. 0 local qubits for this slice)
+            for (size_t i = 0; i < N; ++i) {
+                // Check if the targetQubit bit is 0 for state i
+                if (((i >> targetQubit) & 1) == 0) {
+                    p0 += (double)state[i].x * state[i].x + (double)state[i].y * state[i].y;
+                }
             }
         }
         *d_prob0_sum = p0;
     }
 }
 
-
 // Kernel to collapse the state vector based on measurement outcome
 // If outcome is 0, zero out states where targetQubit is 1.
 // If outcome is 1, zero out states where targetQubit is 0.
 __global__ void collapse_state_kernel(rocComplex* state,
-                                      unsigned numQubits,
-                                      unsigned targetQubit,
+                                      unsigned numQubits, // Total qubits in this state vector (slice)
+                                      unsigned targetQubit, // Local index of target qubit
                                       int measuredOutcome) {
     size_t N = 1ULL << numQubits;
-    size_t k = 1ULL << targetQubit;
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (tid < N) {
+    if (tid < N) { // Check bounds for the current slice
         bool targetQubitIsOne = ((tid >> targetQubit) & 1);
         if (measuredOutcome == 0 && targetQubitIsOne) { // Measured 0, so zero out states where qubit is 1
             state[tid] = make_hipFloatComplex(0.0f, 0.0f);
         } else if (measuredOutcome == 1 && !targetQubitIsOne) { // Measured 1, so zero out states where qubit is 0
             state[tid] = make_hipFloatComplex(0.0f, 0.0f);
         }
+        // Else, the amplitude remains (it's part of the collapsed state)
     }
 }
 
@@ -61,28 +56,133 @@ __global__ void collapse_state_kernel(rocComplex* state,
 // sum_sq_mag = sum(|amp_i|^2) over remaining non-zero amplitudes
 // norm_factor = 1.0 / sqrt(sum_sq_mag)
 // amp_i_new = amp_i_old * norm_factor
-// This also needs a proper parallel reduction for sum_sq_mag.
 __global__ void renormalize_state_kernel(rocComplex* state,
-                                         unsigned numQubits,
+                                         unsigned numQubits, // Total qubits in this state vector (slice)
                                          double d_sum_sq_mag_inv_sqrt) { // Pass 1.0/sqrt(sum_sq_mag)
     size_t N = 1ULL << numQubits;
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (tid < N) {
+    if (tid < N) { // Check bounds for the current slice
         state[tid].x *= d_sum_sq_mag_inv_sqrt;
         state[tid].y *= d_sum_sq_mag_inv_sqrt;
     }
 }
 
 // Placeholder for sum of square magnitudes kernel (also needs proper reduction)
-__global__ void sum_sq_magnitudes_kernel(const rocComplex* state, unsigned numQubits, double* d_sum_sq_mag) {
+// THIS IS A PLACEHOLDER KERNEL LOGIC (SINGLE GPU CONTEXT)
+__global__ void sum_sq_magnitudes_kernel(const rocComplex* state,
+                                         unsigned numQubits, // Total qubits in this state vector (slice)
+                                         double* d_sum_sq_mag) {
     size_t N = 1ULL << numQubits;
     // HACK: Single thread calculation for now
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         double current_sum_sq_mag = 0.0;
-        for (size_t i = 0; i < N; ++i) {
-            current_sum_sq_mag += (double)state[i].x * state[i].x + (double)state[i].y * state[i].y;
+        if (N > 0) {
+            for (size_t i = 0; i < N; ++i) {
+                current_sum_sq_mag += (double)state[i].x * state[i].x + (double)state[i].y * state[i].y;
+            }
         }
         *d_sum_sq_mag = current_sum_sq_mag;
+    }
+}
+
+
+// --- New Kernels for Multi-GPU Measurement ---
+
+// Performs a block-level reduction to calculate sum of probabilities for |0> and |1> states of a target qubit.
+// Output d_block_partial_probs must be pre-allocated to hold 2 * gridDim.x doubles.
+// Each block writes its two sums (prob0_block, prob1_block) to its designated slot.
+__global__ void calculate_local_slice_probabilities_kernel(
+    const rocComplex* local_slice_data,
+    size_t local_slice_num_elements,    // Number of elements in this GPU's slice
+    unsigned num_local_qubits,          // Number of qubits represented by local_slice_data
+    unsigned local_target_qubit,        // Index of the qubit to measure (local to this slice)
+    double* d_block_partial_probs) {    // Output: array for [block0_p0, block0_p1, block1_p0, block1_p1, ...]
+
+    extern __shared__ double sdata[]; // Shared memory for reduction, size: blockDim.x * 2 doubles
+
+    unsigned int tid_in_block = threadIdx.x;
+    size_t global_idx_start = blockIdx.x * blockDim.x;
+
+    double my_prob0 = 0.0;
+    double my_prob1 = 0.0;
+
+    // Each thread processes multiple elements if necessary (grid-stride loop)
+    for (size_t i = tid_in_block; i < blockDim.x; i += blockDim.x) { // This loop is over elements within a block's responsibility
+        size_t current_local_idx = global_idx_start + i;
+        if (current_local_idx < local_slice_num_elements) {
+            rocComplex amp = local_slice_data[current_local_idx];
+            double mag_sq = (double)amp.x * amp.x + (double)amp.y * amp.y;
+
+            if (((current_local_idx >> local_target_qubit) & 1) == 0) { // Qubit is |0>
+                my_prob0 += mag_sq;
+            } else { // Qubit is |1>
+                my_prob1 += mag_sq;
+            }
+        }
+    }
+
+    sdata[tid_in_block] = my_prob0;
+    sdata[tid_in_block + blockDim.x] = my_prob1; // Store prob1 sums after prob0 sums
+    __syncthreads();
+
+    // Parallel reduction within the block for prob0
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid_in_block < s) {
+            sdata[tid_in_block] += sdata[tid_in_block + s];
+        }
+        __syncthreads();
+    }
+    // Parallel reduction within the block for prob1
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid_in_block < s) {
+            sdata[tid_in_block + blockDim.x] += sdata[tid_in_block + blockDim.x + s];
+        }
+        __syncthreads();
+    }
+
+    // Block leader writes the reduced sum for this block
+    if (tid_in_block == 0) {
+        d_block_partial_probs[blockIdx.x * 2 + 0] = sdata[0];             // prob0 for this block
+        d_block_partial_probs[blockIdx.x * 2 + 1] = sdata[blockDim.x];    // prob1 for this block
+    }
+}
+
+
+// Performs a block-level reduction for sum of squared magnitudes.
+// Output d_block_sum_sq_mag must be pre-allocated to hold gridDim.x doubles.
+// Each block writes its sum to its designated slot.
+__global__ void calculate_local_slice_sum_sq_mag_kernel(
+    const rocComplex* local_slice_data,
+    size_t local_slice_num_elements,    // Number of elements in this GPU's slice
+    double* d_block_sum_sq_mag) {       // Output: array for [block0_sum, block1_sum, ...]
+
+    extern __shared__ double sdata_sum[]; // Shared memory for reduction, size: blockDim.x doubles
+
+    unsigned int tid_in_block = threadIdx.x;
+    size_t global_idx_start = blockIdx.x * blockDim.x;
+
+    double my_sum_sq = 0.0;
+
+    for (size_t i = tid_in_block; i < blockDim.x; i += blockDim.x) {
+        size_t current_local_idx = global_idx_start + i;
+        if (current_local_idx < local_slice_num_elements) {
+            rocComplex amp = local_slice_data[current_local_idx];
+            my_sum_sq += (double)amp.x * amp.x + (double)amp.y * amp.y;
+        }
+    }
+
+    sdata_sum[tid_in_block] = my_sum_sq;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid_in_block < s) {
+            sdata_sum[tid_in_block] += sdata_sum[tid_in_block + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid_in_block == 0) {
+        d_block_sum_sq_mag[blockIdx.x] = sdata_sum[0];
     }
 }
