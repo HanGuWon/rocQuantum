@@ -186,3 +186,85 @@ __global__ void calculate_local_slice_sum_sq_mag_kernel(
         d_block_sum_sq_mag[blockIdx.x] = sdata_sum[0];
     }
 }
+
+// Kernel to reduce an array of block-level probability sums (prob0, prob1 pairs) to a final slice total.
+// d_block_partial_probs: input array of size num_blocks * 2.
+// d_slice_total_probs_out: output array of size 2 (total_prob0, total_prob1 for the slice).
+// Assumes this kernel is launched with enough threads/blocks to efficiently sum d_block_partial_probs.
+// For simplicity, this can be a single block if num_blocks is not excessively large (e.g., < 1024*2).
+__global__ void reduce_block_sums_to_slice_total_probs_kernel(
+    const double* d_block_partial_probs, // Flattened array: [b0p0, b0p1, b1p0, b1p1, ...]
+    unsigned num_blocks_from_previous_kernel,
+    double* d_slice_total_probs_out) { // Output: [total_p0, total_p1]
+
+    extern __shared__ double s_reduce_probs[]; // Shared memory, size: blockDim.x * 2 for p0 and p1 sums
+
+    unsigned int tid = threadIdx.x;
+
+    double my_p0_sum = 0.0;
+    double my_p1_sum = 0.0;
+
+    // Each thread sums a portion of the d_block_partial_probs array
+    // This loop structure assumes this kernel is launched with a single block,
+    // and blockDim.x is large enough, or it's a grid-stride loop.
+    // For a simple single-block reduction:
+    for (unsigned i = tid; i < num_blocks_from_previous_kernel; i += blockDim.x) {
+        my_p0_sum += d_block_partial_probs[i * 2 + 0];
+        my_p1_sum += d_block_partial_probs[i * 2 + 1];
+    }
+
+    s_reduce_probs[tid] = my_p0_sum;
+    s_reduce_probs[tid + blockDim.x] = my_p1_sum; // Store p1 sums after p0 sums
+    __syncthreads();
+
+    // Reduce p0 sums in shared memory
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_reduce_probs[tid] += s_reduce_probs[tid + s];
+        }
+        __syncthreads();
+    }
+    // Reduce p1 sums in shared memory
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) { // tid is relative to the start of p1 sums in shared memory
+            s_reduce_probs[tid + blockDim.x] += s_reduce_probs[tid + blockDim.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        d_slice_total_probs_out[0] = s_reduce_probs[0];
+        d_slice_total_probs_out[1] = s_reduce_probs[blockDim.x];
+    }
+}
+
+
+// Kernel to reduce an array of block-level sum-squared-magnitudes to a final slice total.
+// d_block_sum_sq_mag: input array of size num_blocks.
+// d_slice_total_sum_sq_mag_out: output array of size 1.
+__global__ void reduce_block_sums_to_slice_total_sum_sq_mag_kernel(
+    const double* d_block_sum_sq_mag_in, // Array of sums from each block of previous kernel
+    unsigned num_blocks_from_previous_kernel,
+    double* d_slice_total_sum_sq_mag_out) { // Output: single double for the slice's total sum_sq_mag
+
+    extern __shared__ double s_reduce_sum_sq[]; // Shared memory, size: blockDim.x
+    unsigned int tid = threadIdx.x;
+    double my_sum = 0.0;
+
+    for (unsigned i = tid; i < num_blocks_from_previous_kernel; i += blockDim.x) {
+        my_sum += d_block_sum_sq_mag_in[i];
+    }
+    s_reduce_sum_sq[tid] = my_sum;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_reduce_sum_sq[tid] += s_reduce_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        d_slice_total_sum_sq_mag_out[0] = s_reduce_sum_sq[0];
+    }
+}
