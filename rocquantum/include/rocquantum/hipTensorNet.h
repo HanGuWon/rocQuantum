@@ -110,12 +110,132 @@ public:
     }
 
 
-//private: // Make these public for C-API access initially, or provide getters
 public:
-    std::vector<rocquantum::util::rocTensor> tensors_;
-    // Contraction specified as pairs of (tensor_index, mode_index)
-    std::vector<std::pair<std::pair<int, int>, std::pair<int, int>>> contractions_;
-    // TODO: Add more sophisticated connectivity representation (e.g., hypergraph or list of shared indices)
+    // Stores the initial tensors added to the network.
+    std::vector<rocquantum::util::rocTensor> initial_tensors_;
+    // Note: The `contractions_` member defined by pairs of (tensor_idx, mode_idx)
+    // is too simplistic for dynamic pathfinding based on shared labels.
+    // Pathfinding will dynamically identify contractions.
+    // We might retain `contractions_` if it's used to declare *intended*
+    // connections by label, which pathfinding can then verify or use as hints.
+    // For now, let's assume pathfinding works primarily on shared labels.
+    // The declared_contractions_ member is removed as pathfinding will be dynamic.
+
+
+    // Helper structure for pathfinding
+    struct ContractionCandidate {
+        int tensor_idx1;
+        int tensor_idx2;
+        std::vector<std::pair<int, int>> mode_pairs_to_contract; // (mode_idx_in_tensor1, mode_idx_in_tensor2)
+        long long resulting_tensor_size;
+        // Could add other cost metrics here (e.g., FLOPs)
+
+        bool operator<(const ContractionCandidate& other) const {
+            return resulting_tensor_size < other.resulting_tensor_size;
+        }
+    };
+
+
+private:
+    /**
+     * @brief Finds all shared labels between two tensors and the corresponding mode indices.
+     * @param t1 First tensor.
+     * @param t2 Second tensor.
+     * @return A vector of pairs, where each pair contains {mode_idx_in_t1, mode_idx_in_t2} for a shared label.
+     */
+    std::vector<std::pair<int, int>> find_shared_mode_indices(
+        const rocquantum::util::rocTensor& t1,
+        const rocquantum::util::rocTensor& t2) const {
+
+        std::vector<std::pair<int, int>> shared_indices;
+        if (t1.labels_.empty() || t2.labels_.empty()) {
+            return shared_indices; // Cannot find shared labels if not defined
+        }
+
+        for (size_t i = 0; i < t1.rank(); ++i) {
+            if (t1.labels_[i].empty()) continue; // Skip empty labels
+            for (size_t j = 0; j < t2.rank(); ++j) {
+                if (t2.labels_[j].empty()) continue;
+                if (t1.labels_[i] == t2.labels_[j]) {
+                    // Check if dimensions match for this potential contraction
+                    if (t1.dimensions_[i] == t2.dimensions_[j]) {
+                        shared_indices.push_back({static_cast<int>(i), static_cast<int>(j)});
+                    } else {
+                        // Optional: Log a warning or throw if labels match but dims don't
+                        // For now, just don't consider it a valid contraction pair
+                    }
+                    // Assuming a label is unique within a tensor for contraction purposes.
+                    // If a label can appear multiple times on *different* modes of the same tensor,
+                    // this logic would need to be more complex or such labels disallowed for simple contraction.
+                    break; // Found match for t1.labels_[i], move to next label in t1
+                }
+            }
+        }
+        return shared_indices;
+    }
+
+    /**
+     * @brief Calculates the metadata (dimensions, labels) of a tensor resulting from contracting two tensors.
+     * @param t1 First tensor.
+     * @param t2 Second tensor.
+     * @param contracted_mode_pairs Pairs of (mode_idx_t1, mode_idx_t2) that are contracted.
+     * @param out_new_dims Output vector for dimensions of the resulting tensor.
+     * @param out_new_labels Output vector for labels of the resulting tensor.
+     */
+    void get_resulting_tensor_metadata(
+        const rocquantum::util::rocTensor& t1,
+        const rocquantum::util::rocTensor& t2,
+        const std::vector<std::pair<int, int>>& contracted_mode_pairs,
+        std::vector<long long>& out_new_dims,
+        std::vector<std::string>& out_new_labels) const {
+
+        out_new_dims.clear();
+        out_new_labels.clear();
+        std::vector<bool> t1_mode_contracted(t1.rank(), false);
+        std::vector<bool> t2_mode_contracted(t2.rank(), false);
+
+        for(const auto& p : contracted_mode_pairs) {
+            t1_mode_contracted[p.first] = true;
+            t2_mode_contracted[p.second] = true;
+        }
+
+        // Add uncontracted modes from t1
+        for (size_t i = 0; i < t1.rank(); ++i) {
+            if (!t1_mode_contracted[i]) {
+                out_new_dims.push_back(t1.dimensions_[i]);
+                if (i < t1.labels_.size() && !t1.labels_[i].empty()) {
+                    out_new_labels.push_back(t1.labels_[i]);
+                } else {
+                     // Generate a unique placeholder label if needed, or leave empty
+                    out_new_labels.push_back("uncontracted_A_" + std::to_string(i));
+                }
+            }
+        }
+        // Add uncontracted modes from t2
+        for (size_t i = 0; i < t2.rank(); ++i) {
+            if (!t2_mode_contracted[i]) {
+                out_new_dims.push_back(t2.dimensions_[i]);
+                 if (i < t2.labels_.size() && !t2.labels_[i].empty()) {
+                    out_new_labels.push_back(t2.labels_[i]);
+                } else {
+                    out_new_labels.push_back("uncontracted_B_" + std::to_string(i));
+                }
+            }
+        }
+        if (out_new_dims.empty()) { // Result is a scalar
+            out_new_dims.push_back(1); // Represent scalar as dim {1}
+            out_new_labels.push_back("scalar_result");
+        }
+    }
+
+
+public:
+    // Keep track of active tensors during contraction using their indices from a temporary list.
+    // Or, better, a list of rocTensor objects that shrinks.
+    // For simplicity in this step, we'll operate on copies and rebuild.
+    std::vector<rocquantum::util::rocTensor> active_tensors_during_contraction_;
+
+
 };
 
 } // namespace rocquantum
@@ -158,9 +278,9 @@ rocqStatus_t rocTensorNetworkAddTensor(rocTensorNetworkHandle_t handle, const ro
  * @param mode_idx_B Mode index of the second tensor.
  * @return rocqStatus_t Status of the operation.
  */
-rocqStatus_t rocTensorNetworkAddContraction(rocTensorNetworkHandle_t handle,
-                                            int tensor_idx_A, int mode_idx_A,
-                                            int tensor_idx_B, int mode_idx_B);
+// rocStatus_t rocTensorNetworkAddContraction(rocTensorNetworkHandle_t handle,
+//                                             int tensor_idx_A, int mode_idx_A,
+//                                             int tensor_idx_B, int mode_idx_B); // Removed
 
 /**
  * @brief Contracts the tensor network.

@@ -156,6 +156,24 @@ struct rocTensor {
     size_t rank() const {
         return dimensions_.size();
     }
+
+    /**
+     * @brief Gets all mode indices that have a specific label.
+     * @param label The label to search for.
+     * @return A vector of mode indices. Empty if label not found or labels_ is empty.
+     */
+    std::vector<int> get_mode_indices_for_label(const std::string& query_label) const {
+        std::vector<int> indices;
+        if (query_label.empty() || labels_.empty()) {
+            return indices;
+        }
+        for (size_t i = 0; i < labels_.size(); ++i) {
+            if (labels_[i] == query_label) {
+                indices.push_back(static_cast<int>(i));
+            }
+        }
+        return indices;
+    }
 };
 
 
@@ -290,9 +308,22 @@ rocqStatus_t rocTensorContractWithRocBLAS(
     rocTensor* result_tensor,
     const rocTensor* tensorA,
     const rocTensor* tensorB,
-    const char* contraction_indices_spec, // Placeholder for actual spec
+    const char* contraction_indices_spec, // Placeholder for actual spec, e.g., "ijk,klm->ijlm"
     rocblas_handle blas_handle,
     hipStream_t stream);
+
+// Internal helper (not part of C-API directly but used by it)
+// This is where the core logic will reside.
+rocqStatus_t rocTensorContractPair_internal(
+    rocTensor* result_tensor,           // Output tensor, must be pre-allocated by caller
+    const rocTensor* tensorA,
+    const rocTensor* tensorB,
+    const std::vector<std::pair<int, int>>& contracted_mode_pairs_A_B, // Pairs of (mode_idx_in_A, mode_idx_in_B)
+    const std::vector<int>& result_A_modes_order, // Order of tensorA's uncontracted modes in result
+    const std::vector<int>& result_B_modes_order, // Order of tensorB's uncontracted modes in result
+    rocblas_handle blas_handle,
+    hipStream_t stream);
+
 
 } // namespace util
 } // namespace rocquantum
