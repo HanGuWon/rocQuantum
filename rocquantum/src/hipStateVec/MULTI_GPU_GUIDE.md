@@ -61,10 +61,20 @@ Gate application functions have been adapted for multi-GPU operation:
 ### Measurement (`rocsvMeasure`)
 - **`rocqStatus_t rocsvMeasure(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned qubitToMeasure, int* h_outcome, double* h_probability);`**
   This function has been refactored to support multi-GPU measurement **if `qubitToMeasure` is a local-domain bit** (i.e., `qubitToMeasure < h->numLocalQubitsPerGpu`).
-    - **Probability Calculation:** New kernels (`calculate_local_slice_probabilities_kernel`) are used on each GPU to calculate partial probabilities for measuring '0' and '1' for the target qubit within its slice. These kernels use block-level reduction with shared memory. The partial probabilities from all blocks on a GPU are then further summed (currently on host after D2H copy of block sums) to get per-GPU slice probabilities. These are then summed across GPUs on the host to determine the global measurement outcome.
+    - **Probability Calculation:**
+        - Each GPU performs a two-stage reduction for its local slice:
+            1. `calculate_local_slice_probabilities_kernel` computes block-level sums for P(0) and P(1).
+            2. `reduce_block_sums_to_slice_total_probs_kernel` reduces these block sums to a single pair [P(0)_slice, P(1)_slice] for that GPU.
+        - These per-GPU [P(0)_slice, P(1)_slice] pairs are then summed across all GPUs using `rcclAllReduce` (sum operation). The result (global P(0), global P(1)) is available on all GPUs and copied from GPU 0 to the host.
+        - The host determines the measurement outcome based on these global probabilities.
     - **State Collapse:** The `collapse_state_kernel` (which is element-wise) is applied on each GPU slice based on the global outcome and the local index of `qubitToMeasure`.
-    - **Renormalization:** New kernels (`calculate_local_slice_sum_sq_mag_kernel`) calculate the sum of squared magnitudes on each slice post-collapse (also using block-level reduction). These are aggregated on the host to find the global normalization factor, which is then applied via `renormalize_state_kernel` (element-wise) on each slice.
-    - **Single-GPU Path:** The single-GPU path within `rocsvMeasure` has also been updated to use these new, more robust reduction kernels.
+    - **Renormalization:**
+        - A similar two-stage reduction is performed on each GPU for the sum of squared magnitudes post-collapse:
+            1. `calculate_local_slice_sum_sq_mag_kernel` computes block-level sums.
+            2. `reduce_block_sums_to_slice_total_sum_sq_mag_kernel` reduces these to a single sum_sq_mag_slice for that GPU.
+        - These per-GPU sums are aggregated globally using `rcclAllReduce` (sum operation). The result is copied from GPU 0 to the host.
+        - The host calculates the normalization factor, which is then used by `renormalize_state_kernel` (element-wise) on each slice.
+    - **Single-GPU Path:** The single-GPU path within `rocsvMeasure` has also been updated to use this more robust two-stage local reduction logic.
     - **Limitation:** Measuring a slice-determining qubit directly (i.e. `qubitToMeasure >= h->numLocalQubitsPerGpu` in a multi-GPU context) is `ROCQ_STATUS_NOT_IMPLEMENTED`. It would require `rocsvSwapIndexBits` to make that qubit local first. The `d_state` parameter is legacy for multi-GPU mode; the function uses the handle's distributed state.
 
 ## Gate Fusion
