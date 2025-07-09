@@ -3,10 +3,14 @@
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h> // For rocblas_handle, rocblas_cgemm etc.
 #include <vector>
+#include <string>
 #include <numeric>      // For std::accumulate, std::iota
 #include <stdexcept>    // For error reporting
 #include <algorithm>    // For std::sort, std::find, std::set_difference etc.
 #include <map>          // For mapping mode indices
+#include <set>          // For finding unique labels
+#include <sstream>      // For parsing (though simple parsing is used here)
+
 
 // Forward declare the kernel (it's in rocTensorUtil_kernels.hip, but this .cpp file compiles separately)
 __global__ void permute_tensor_kernel(
@@ -24,15 +28,10 @@ __global__ void permute_tensor_kernel(
 namespace rocquantum {
 namespace util {
 
-// External checkHipError from hipStateVec.cpp, or define one locally if this is a standalone util.
-// For now, assume it's accessible as rocquantum::util::checkHipError or similar if needed.
-// Or, more simply, just use the one from hipStateVec.h if it's made generally available.
-// Let's assume checkHipError is available.
-
 rocqStatus_t rocTensorPermute(
     rocTensor* output_tensor,
     const rocTensor* input_tensor,
-    const std::vector<int>& host_permutation_map // p[new_mode_idx] = old_mode_idx
+    const std::vector<int>& host_permutation_map
 ) {
     if (!output_tensor || !input_tensor) {
         return ROCQ_STATUS_INVALID_VALUE;
@@ -43,11 +42,10 @@ rocqStatus_t rocTensorPermute(
     if (input_tensor->rank() == 0) {
         if (input_tensor->get_element_count() == 1 && output_tensor->get_element_count() == 1) {
             if (output_tensor->data_ && input_tensor->data_) {
-                 // Ensure current device is set if using default stream, or pass stream from handle
-                 // hipStream_t stream = 0; // default stream
-                 // For safety, if this util is used with specific streams, they should be passed.
                  hipError_t err = hipMemcpy(output_tensor->data_, input_tensor->data_, sizeof(rocComplex), hipMemcpyDeviceToDevice);
-                 return checkHipError(err, "rocTensorPermute hipMemcpy scalar");
+                 // Assuming checkHipError is available globally or in this namespace from hipStateVec.h
+                 // If not, it needs to be defined or included properly. For now, assume it is.
+                  return rocquantum::checkHipError(err, "rocTensorPermute hipMemcpy scalar");
             }
             return ROCQ_STATUS_SUCCESS;
         }
@@ -65,18 +63,13 @@ rocqStatus_t rocTensorPermute(
     if (!input_tensor->data_ || !output_tensor->data_) {
         return ROCQ_STATUS_INVALID_VALUE;
     }
-     // Ensure strides are calculated
-    if (input_tensor->strides_.empty() && input_tensor->rank() > 0) {
-        // This is problematic if input_tensor is const.
-        // The design should ensure tensors always have strides when used.
-        // For now, let's assume they are pre-calculated or rocTensor constructor did it.
-        // const_cast<rocTensor*>(input_tensor)->calculate_strides(); // Risky if not intended
-        if(input_tensor->dimensions_.size() != input_tensor->strides_.size()){
-             return ROCQ_STATUS_INVALID_VALUE; // Strides must be present
-        }
+    if(input_tensor->dimensions_.size() != input_tensor->strides_.size() && input_tensor->rank() > 0){
+            // This implies strides were not calculated for a non-scalar tensor.
+            // The rocTensor constructor should handle this, or it's an invalid setup.
+             return ROCQ_STATUS_INVALID_VALUE;
     }
     if (output_tensor->strides_.empty() && output_tensor->rank() > 0) {
-        output_tensor->calculate_strides(); // Output tensor can be modified
+        output_tensor->calculate_strides();
     }
 
 
@@ -123,16 +116,16 @@ rocqStatus_t rocTensorPermute(
 
     if (num_blocks > 0) {
         hipLaunchKernelGGL(permute_tensor_kernel,
-                           dim3(num_blocks), dim3(threads_per_block), 0, 0, // Default stream
+                           dim3(num_blocks), dim3(threads_per_block), 0, 0,
                            output_tensor->data_, input_tensor->data_,
                            d_input_dims, d_input_strides,
                            d_output_dims, d_output_strides,
                            d_permutation_map_gpu, num_modes, total_elements);
 
         hip_err = hipGetLastError();
-        if (hip_err != hipSuccess) { status = checkHipError(hip_err, "permute_tensor_kernel launch"); goto perm_cleanup;}
+        if (hip_err != hipSuccess) { status = rocquantum::checkHipError(hip_err, "permute_tensor_kernel launch"); goto perm_cleanup;}
         hip_err = hipStreamSynchronize(0);
-        if (hip_err != hipSuccess) { status = checkHipError(hip_err, "rocTensorPermute hipStreamSynchronize");}
+        if (hip_err != hipSuccess) { status = rocquantum::checkHipError(hip_err, "rocTensorPermute hipStreamSynchronize");}
     }
 
 perm_cleanup:
@@ -149,9 +142,9 @@ rocqStatus_t rocTensorContractPair_internal(
     rocTensor* result_tensor,
     const rocTensor* tensorA,
     const rocTensor* tensorB,
-    const std::vector<std::pair<int, int>>& contracted_mode_pairs_A_B, // (modeA_idx, modeB_idx)
-    const std::vector<int>& result_A_modes_initial_order, // Uncontracted mode indices from A, in their original order
-    const std::vector<int>& result_B_modes_initial_order, // Uncontracted mode indices from B, in their original order
+    const std::vector<std::pair<int, int>>& contracted_mode_pairs_A_B,
+    const std::vector<int>& result_A_modes_initial_order,
+    const std::vector<int>& result_B_modes_initial_order,
     rocblas_handle blas_handle,
     hipStream_t stream) {
 
@@ -160,125 +153,89 @@ rocqStatus_t rocTensorContractPair_internal(
     }
     if (!tensorA->data_ || !tensorB->data_) return ROCQ_STATUS_INVALID_VALUE;
 
-    rocqStatus_t status = rocblas_set_stream(blas_handle, stream);
-    if (status != rocblas_status_success) return ROCQ_STATUS_FAILURE;
+    rocqStatus_t status_check = ROCQ_STATUS_SUCCESS; // Using rocqStatus_t for internal checks too
+    rocblas_status blas_status_err = rocblas_set_stream(blas_handle, stream);
+    if (blas_status_err != rocblas_status_success) return ROCQ_STATUS_FAILURE;
 
-    // 1. Prepare metadata for permuted tensors and GEMM
-    std::vector<int> permA_map, permB_map;
-    std::vector<long long> dimsA_permuted, dimsB_permuted;
 
     long long M = 1, N = 1, K = 1;
-    std::vector<int> mode_map_A_to_K; // Contracted modes of A
-    std::vector<int> mode_map_A_to_M; // Uncontracted modes of A (row index of matrix A)
+    std::vector<int> permA_map_new_idx_is_old_idx;
+    std::vector<int> permB_map_new_idx_is_old_idx;
 
-    std::vector<int> mode_map_B_to_K; // Contracted modes of B
-    std::vector<int> mode_map_B_to_N; // Uncontracted modes of B (col index of matrix B)
+    std::vector<long long> dimsA_permuted_vec;
+    std::vector<long long> dimsB_permuted_vec;
 
     std::vector<bool> is_mode_A_contracted(tensorA->rank(), false);
     std::vector<bool> is_mode_B_contracted(tensorB->rank(), false);
+    std::vector<int> contracted_modes_A_orig_indices;
+    std::vector<int> contracted_modes_B_orig_indices;
+
 
     for(const auto& p : contracted_mode_pairs_A_B) {
-        mode_map_A_to_K.push_back(p.first);
         is_mode_A_contracted[p.first] = true;
-        mode_map_B_to_K.push_back(p.second);
+        contracted_modes_A_orig_indices.push_back(p.first);
         is_mode_B_contracted[p.second] = true;
-        K *= tensorA->dimensions_[p.first]; // Assuming dimensions match, checked by caller (TensorNetwork)
+        contracted_modes_B_orig_indices.push_back(p.second);
+        K *= tensorA->dimensions_[p.first];
     }
 
-    for(int mode_idx : result_A_modes_initial_order) { // These are original indices from tensorA
-        if (!is_mode_A_contracted[mode_idx]) {
-            mode_map_A_to_M.push_back(mode_idx);
-            M *= tensorA->dimensions_[mode_idx];
+    // Order for permuted A: [uncontracted_A_modes (M part), contracted_A_modes (K part)]
+    // result_A_modes_initial_order contains original indices of uncontracted A modes
+    for(int mode_idx : result_A_modes_initial_order) {
+        permA_map_new_idx_is_old_idx.push_back(mode_idx);
+        dimsA_permuted_vec.push_back(tensorA->dimensions_[mode_idx]);
+        M *= tensorA->dimensions_[mode_idx];
+    }
+    for(int mode_idx : contracted_modes_A_orig_indices) {
+        permA_map_new_idx_is_old_idx.push_back(mode_idx);
+        dimsA_permuted_vec.push_back(tensorA->dimensions_[mode_idx]);
+    }
+
+    // Order for permuted B: [contracted_B_modes (K part), uncontracted_B_modes (N part)]
+    for(int mode_idx : contracted_modes_B_orig_indices) {
+        permB_map_new_idx_is_old_idx.push_back(mode_idx);
+        dimsB_permuted_vec.push_back(tensorB->dimensions_[mode_idx]);
+    }
+    for(int mode_idx : result_B_modes_initial_order) {
+        permB_map_new_idx_is_old_idx.push_back(mode_idx);
+        dimsB_permuted_vec.push_back(tensorB->dimensions_[mode_idx]);
+        N *= tensorB->dimensions_[mode_idx];
+    }
+
+    if (M == 0 || N == 0 || K == 0) {
+        if (M * N != result_tensor->get_element_count() && result_tensor->get_element_count() !=0 ) return ROCQ_STATUS_INVALID_VALUE;
+        if (result_tensor->data_ && result_tensor->get_element_count() > 0) {
+            hipMemsetAsync(result_tensor->data_, 0, result_tensor->get_element_count() * sizeof(rocComplex), stream);
+            hipStreamSynchronize(stream);
+            return ROCQ_STATUS_SUCCESS;
+        } else if (result_tensor->get_element_count() == 0) {
+             return ROCQ_STATUS_SUCCESS; // Contracting to a 0-element tensor
         }
     }
-    for(int mode_idx : result_B_modes_initial_order) { // These are original indices from tensorB
-         if (!is_mode_B_contracted[mode_idx]) {
-            mode_map_B_to_N.push_back(mode_idx);
-            N *= tensorB->dimensions_[mode_idx];
-        }
-    }
 
-    // If M, N, or K is 0 (e.g. from a zero dimension), contraction result is effectively zero or invalid.
-    // For simplicity, assume valid non-zero dimensions for M,N,K here.
-    // A robust implementation would handle zero dimensions.
-    if (M==0 || N==0 || K==0) {
-        if (result_tensor->get_element_count() > 0) { // If result is expected to be non-empty
-             // This implies an issue, or result should be zero-filled.
-             // For now, let's assume M,N,K > 0 for a valid contraction leading to non-empty result.
-             // If result_tensor has 0 elements, it might be fine.
-            if (M*N != result_tensor->get_element_count()) return ROCQ_STATUS_INVALID_VALUE; // Shape mismatch
-            if (result_tensor->data_) { // Fill with zero if expected result is non-empty but M,N,K implies zero work
-                hipMemsetAsync(result_tensor->data_, 0, result_tensor->get_element_count() * sizeof(rocComplex), stream);
-                return ROCQ_STATUS_SUCCESS; // Or indicate a trivial contraction
-            }
-        } else if (M*N == 0 && result_tensor->get_element_count() == 0) {
-            return ROCQ_STATUS_SUCCESS; // Contracting to a 0-element tensor
-        }
-    }
-
-
-    // Create permutation maps: new_order[new_idx] = old_idx
-    // For A: uncontracted modes (M part), then contracted modes (K part)
-    permA_map.reserve(tensorA->rank());
-    for(int old_idx : mode_map_A_to_M) permA_map.push_back(old_idx);
-    for(int old_idx : mode_map_A_to_K) permA_map.push_back(old_idx);
-
-    // For B: contracted modes (K part), then uncontracted modes (N part)
-    permB_map.reserve(tensorB->rank());
-    for(int old_idx : mode_map_B_to_K) permB_map.push_back(old_idx);
-    for(int old_idx : mode_map_B_to_N) permB_map.push_back(old_idx);
-
-    // Inverse permutation maps for rocTensorPermute (p[new_idx] = old_idx)
-    std::vector<int> inv_permA_map(num_modesA);
-    std::vector<int> inv_permB_map(num_modesB);
-
-    for(size_t i=0; i < permA_map.size(); ++i) {
-        dimsA_permuted.push_back(tensorA->dimensions_[permA_map[i]]);
-        inv_permA_map[i] = permA_map[i]; // This is not inverse, this is p[new]=old if permA_map is p[new]=old
-                                        // rocTensorPermute expects p[new_idx] = old_idx.
-                                        // The permA_map IS p[new_idx]=old_idx.
-    }
-     for(size_t i=0; i < permB_map.size(); ++i) {
-        dimsB_permuted.push_back(tensorB->dimensions_[permB_map[i]]);
-        // inv_permB_map[i] = permB_map[i]; // Same here
-    }
-
-
-    // 2. Allocate and Permute Tensors
     rocTensor permutedA_tensor, permutedB_tensor;
-    permutedA_tensor.dimensions_ = dimsA_permuted;
-    permutedB_tensor.dimensions_ = dimsB_permuted;
+    permutedA_tensor.dimensions_ = dimsA_permuted_vec;
+    permutedA_tensor.calculate_strides(); // Important
+    permutedB_tensor.dimensions_ = dimsB_permuted_vec;
+    permutedB_tensor.calculate_strides(); // Important
 
-    status = rocTensorAllocate(&permutedA_tensor);
-    if (status != ROCQ_STATUS_SUCCESS) return status;
-    status = rocTensorAllocate(&permutedB_tensor);
-    if (status != ROCQ_STATUS_SUCCESS) { rocTensorFree(&permutedA_tensor); return status; }
+    status_check = rocTensorAllocate(&permutedA_tensor);
+    if (status_check != ROCQ_STATUS_SUCCESS) return status_check;
+    status_check = rocTensorAllocate(&permutedB_tensor);
+    if (status_check != ROCQ_STATUS_SUCCESS) { rocTensorFree(&permutedA_tensor); return status_check; }
 
-    // rocTensorPermute expects map p[new_idx] = old_idx.
-    // Our permA_map and permB_map are already in this format.
-    status = rocTensorPermute(&permutedA_tensor, tensorA, permA_map);
-    if (status != ROCQ_STATUS_SUCCESS) { rocTensorFree(&permutedA_tensor); rocTensorFree(&permutedB_tensor); return status; }
+    status_check = rocTensorPermute(&permutedA_tensor, tensorA, permA_map_new_idx_is_old_idx);
+    if (status_check != ROCQ_STATUS_SUCCESS) { rocTensorFree(&permutedA_tensor); rocTensorFree(&permutedB_tensor); return status_check; }
 
-    status = rocTensorPermute(&permutedB_tensor, tensorB, permB_map);
-    if (status != ROCQ_STATUS_SUCCESS) { rocTensorFree(&permutedA_tensor); rocTensorFree(&permutedB_tensor); return status; }
+    status_check = rocTensorPermute(&permutedB_tensor, tensorB, permB_map_new_idx_is_old_idx);
+    if (status_check != ROCQ_STATUS_SUCCESS) { rocTensorFree(&permutedA_tensor); rocTensorFree(&permutedB_tensor); return status_check; }
 
-    // Synchronize after permutations if rocTensorPermute doesn't sync internally
-    // Assuming rocTensorPermute syncs its stream (default stream 0 for now).
-    // If it used the passed 'stream', then sync that stream here.
-    hipError_t hip_sync_err = hipStreamSynchronize(stream); // Sync the main computation stream
+    hipError_t hip_sync_err = hipStreamSynchronize(stream);
     if(hip_sync_err != hipSuccess) {
         rocTensorFree(&permutedA_tensor); rocTensorFree(&permutedB_tensor);
-        return checkHipError(hip_sync_err, "ContractPair sync after permute");
+        return rocquantum::checkHipError(hip_sync_err, "ContractPair sync after permute");
     }
 
-
-    // 3. Call rocblas_cgemm
-    // A_mat is M x K, B_mat is K x N, C_mat is M x N
-    // For column major: lda=M, ldb=K, ldc=M
-    rocblas_operation opA = ROCBLAS_OPERATION_NONE;
-    rocblas_operation opB = ROCBLAS_OPERATION_NONE;
-
-    // M, N, K must be int for rocBLAS
     int gemm_M = static_cast<int>(M);
     int gemm_N = static_cast<int>(N);
     int gemm_K = static_cast<int>(K);
@@ -286,32 +243,124 @@ rocqStatus_t rocTensorContractPair_internal(
     const rocComplex alpha = {1.0f, 0.0f};
     const rocComplex beta  = {0.0f, 0.0f};
 
-    rocblas_status blas_status = rocblas_cgemm(
-        blas_handle, opA, opB,
+    blas_status_err = rocblas_cgemm(
+        blas_handle, ROCBLAS_OPERATION_NONE, ROCBLAS_OPERATION_NONE,
         gemm_M, gemm_N, gemm_K,
         &alpha,
-        permutedA_tensor.data_, gemm_M, // lda = M (number of rows of matrix A if opA is N)
-        permutedB_tensor.data_, gemm_K, // ldb = K (number of rows of matrix B if opB is N)
+        permutedA_tensor.data_, gemm_M,
+        permutedB_tensor.data_, gemm_K,
         &beta,
-        result_tensor->data_, gemm_M    // ldc = M (number of rows of matrix C)
+        result_tensor->data_, gemm_M
     );
 
-    hip_sync_err = hipStreamSynchronize(stream); // Sync after GEMM
+    hip_sync_err = hipStreamSynchronize(stream);
 
     rocTensorFree(&permutedA_tensor);
     rocTensorFree(&permutedB_tensor);
 
-    if (blas_status != rocblas_status_success) {
-        // Consider mapping rocblas_status to rocqStatus_t more granularly
-        return ROCQ_STATUS_FAILURE;
-    }
-    if(hip_sync_err != hipSuccess) {
-        return checkHipError(hip_sync_err, "ContractPair sync after GEMM");
+    if (blas_status_err != rocblas_status_success) return ROCQ_STATUS_FAILURE;
+    if(hip_sync_err != hipSuccess) return rocquantum::checkHipError(hip_sync_err, "ContractPair sync after GEMM");
+
+    return ROCQ_STATUS_SUCCESS;
+}
+
+// --- Helper for parsing simple Einsum-like strings ---
+// Example: "ab,bc->ac"
+// Populates contracted_pairs, and orders for uncontracted modes from A and B
+// Returns false on parsing error.
+bool parse_simple_einsum_spec(
+    const std::string& spec,
+    const rocTensor* tensorA, const rocTensor* tensorB, // Used to map labels to mode indices
+    std::vector<std::pair<int, int>>& contracted_pairs_A_B,
+    std::vector<int>& result_A_modes_order, // Original mode indices of A that are uncontracted
+    std::vector<int>& result_B_modes_order, // Original mode indices of B that are uncontracted
+    std::vector<long long>& result_dims,    // Dimensions for the result tensor
+    std::vector<std::string>& result_labels // Labels for the result tensor
+) {
+    contracted_pairs_A_B.clear();
+    result_A_modes_order.clear();
+    result_B_modes_order.clear();
+    result_dims.clear();
+    result_labels.clear();
+
+    size_t arrow_pos = spec.find("->");
+    if (arrow_pos == std::string::npos) return false; // Invalid format
+
+    std::string inputs_str = spec.substr(0, arrow_pos);
+    std::string output_str = spec.substr(arrow_pos + 2);
+
+    size_t comma_pos = inputs_str.find(',');
+    if (comma_pos == std::string::npos) return false; // Must have two input tensors
+
+    std::string tensorA_spec_str = inputs_str.substr(0, comma_pos);
+    std::string tensorB_spec_str = inputs_str.substr(comma_pos + 1);
+
+    // Extract labels for A, B, and Result
+    // Assuming labels are single characters for this simple parser.
+    // Tensor names like "A(" are ignored for now, directly use tensorA->labels_
+    std::string labelsA_str, labelsB_str, labelsRes_str;
+    size_t p_open = tensorA_spec_str.find('('); size_t p_close = tensorA_spec_str.find(')');
+    if (p_open != std::string::npos && p_close != std::string::npos && p_close > p_open)
+        labelsA_str = tensorA_spec_str.substr(p_open + 1, p_close - p_open - 1);
+    else labelsA_str = tensorA_spec_str; // Assume raw labels if no parens
+
+    p_open = tensorB_spec_str.find('('); p_close = tensorB_spec_str.find(')');
+    if (p_open != std::string::npos && p_close != std::string::npos && p_close > p_open)
+        labelsB_str = tensorB_spec_str.substr(p_open + 1, p_close - p_open - 1);
+    else labelsB_str = tensorB_spec_str;
+
+    // For result, could also have name C(...)
+    p_open = output_str.find('('); p_close = output_str.find(')');
+     if (p_open != std::string::npos && p_close != std::string::npos && p_close > p_open)
+        labelsRes_str = output_str.substr(p_open + 1, p_close - p_open - 1);
+    else labelsRes_str = output_str;
+
+
+    if (labelsA_str.length() != tensorA->rank() || labelsB_str.length() != tensorB->rank()) return false; // Label count mismatch
+
+    std::map<char, int> map_A_label_to_idx;
+    std::map<char, int> map_B_label_to_idx;
+    for(size_t i=0; i<labelsA_str.length(); ++i) map_A_label_to_idx[labelsA_str[i]] = i;
+    for(size_t i=0; i<labelsB_str.length(); ++i) map_B_label_to_idx[labelsB_str[i]] = i;
+
+    std::set<char> labels_A_set(labelsA_str.begin(), labelsA_str.end());
+    std::set<char> labels_B_set(labelsB_str.begin(), labelsB_str.end());
+    std::set<char> labels_Res_set(labelsRes_str.begin(), labelsRes_str.end());
+
+    // Find contracted indices
+    for (char label_char : labelsA_str) {
+        if (labels_B_set.count(label_char) && !labels_Res_set.count(label_char)) { // Contracted
+            int modeA_idx = map_A_label_to_idx[label_char];
+            int modeB_idx = map_B_label_to_idx[label_char];
+            if (tensorA->dimensions_[modeA_idx] != tensorB->dimensions_[modeB_idx]) return false; // Dim mismatch
+            contracted_pairs_A_B.push_back({modeA_idx, modeB_idx});
+        }
     }
 
-    // Reshape of result_tensor (dimensions, strides, labels) should have been done by the caller (TensorNetwork::contract)
-    // before allocating its memory. rocTensorContractPair_internal just fills the data.
-    return ROCQ_STATUS_SUCCESS;
+    // Determine result mode order and dimensions based on labelsRes_str
+    for (char res_label_char : labelsRes_str) {
+        if (labels_A_set.count(res_label_char) && !labels_B_set.count(res_label_char)) { // From A only
+            int modeA_idx = map_A_label_to_idx[res_label_char];
+            result_A_modes_order.push_back(modeA_idx);
+            result_dims.push_back(tensorA->dimensions_[modeA_idx]);
+            result_labels.push_back(std::string(1, res_label_char));
+        } else if (labels_B_set.count(res_label_char) && !labels_A_set.count(res_label_char)) { // From B only
+            int modeB_idx = map_B_label_to_idx[res_label_char];
+            result_B_modes_order.push_back(modeB_idx);
+            result_dims.push_back(tensorB->dimensions_[modeB_idx]);
+            result_labels.push_back(std::string(1, res_label_char));
+        } else if (labels_A_set.count(res_label_char) && labels_B_set.count(res_label_char)) {
+            return false; // Label appears in both A and B AND in Result - ambiguous for simple contraction
+        } else {
+            return false; // Result label not found in inputs
+        }
+    }
+    if (result_dims.empty() && !contracted_pairs_A_B.empty()) { // Scalar result from full contraction
+        result_dims.push_back(1);
+        result_labels.push_back("scalar");
+    }
+
+    return true;
 }
 
 
@@ -319,34 +368,53 @@ rocqStatus_t rocTensorContractWithRocBLAS(
     rocTensor* result_tensor,
     const rocTensor* tensorA,
     const rocTensor* tensorB,
-    const char* contraction_indices_spec, // e.g., "abc,cd->abd" or list of pairs like "{{1,0},{2,1}}"
+    const char* contraction_indices_spec_char,
     rocblas_handle blas_handle,
     hipStream_t stream) {
 
-    if (!result_tensor || !tensorA || !tensorB || !blas_handle) {
+    if (!result_tensor || !tensorA || !tensorB || !blas_handle || !contraction_indices_spec_char) {
         return ROCQ_STATUS_INVALID_VALUE;
     }
-    if (!result_tensor->data_ || !tensorA->data_ || !tensorB->data_) {
+    // result_tensor->data_ must be pre-allocated by the caller (e.g. TensorNetwork::contract)
+    // after determining the result shape from parsing the spec.
+    if (!tensorA->data_ || !tensorB->data_ ) { // result_tensor->data_ checked in internal
         return ROCQ_STATUS_INVALID_VALUE;
     }
 
-    // TODO: Implement parsing of contraction_indices_spec.
-    // This is a significant task. For now, this C-API is a stub for that part.
-    // It should parse the spec into:
-    // - std::vector<std::pair<int, int>> contracted_mode_pairs_A_B
-    // - std::vector<int> result_A_modes_order (uncontracted modes of A in final result order)
-    // - std::vector<int> result_B_modes_order (uncontracted modes of B in final result order)
-    // And then call rocTensorContractPair_internal.
+    std::string spec(contraction_indices_spec_char);
+    std::vector<std::pair<int, int>> contracted_pairs;
+    std::vector<int> res_A_modes, res_B_modes;
+    std::vector<long long> expected_res_dims;
+    std::vector<std::string> expected_res_labels;
 
-    // Example of how it might be called if spec was already parsed:
-    // std::vector<std::pair<int, int>> example_contract_pairs = {{0,0}}; // Contract mode 0 of A with mode 0 of B
-    // std::vector<int> example_A_order; for(int i=1; i<tensorA->rank(); ++i) example_A_order.push_back(i);
-    // std::vector<int> example_B_order; for(int i=1; i<tensorB->rank(); ++i) example_B_order.push_back(i);
-    // return rocTensorContractPair_internal(result_tensor, tensorA, tensorB,
-    //                                       example_contract_pairs, example_A_order, example_B_order,
-    //                                       blas_handle, stream);
+    bool parsed_ok = parse_simple_einsum_spec(spec, tensorA, tensorB,
+                                            contracted_pairs, res_A_modes, res_B_modes,
+                                            expected_res_dims, expected_res_labels);
 
-    return ROCQ_STATUS_NOT_IMPLEMENTED; // Parsing of spec and calling internal helper not done.
+    if (!parsed_ok) {
+        return ROCQ_STATUS_INVALID_VALUE; // Failed to parse spec
+    }
+
+    // Caller must have set result_tensor dimensions and allocated memory.
+    // Verify consistency:
+    if (result_tensor->dimensions_ != expected_res_dims) {
+        // Optional: could re-allocate result_tensor here if allowed by API contract,
+        // but safer to require caller to pre-allocate correctly.
+        return ROCQ_STATUS_INVALID_VALUE; // Result tensor dimensions mismatch
+    }
+    if (!result_tensor->data_ && result_tensor->get_element_count() > 0) {
+        return ROCQ_STATUS_INVALID_VALUE; // Result tensor not allocated
+    }
+    // Set labels if not already set by caller, or verify
+    if(result_tensor->labels_.empty() && !expected_res_labels.empty()) {
+        result_tensor->labels_ = expected_res_labels;
+    }
+    result_tensor->calculate_strides();
+
+
+    return rocTensorContractPair_internal(result_tensor, tensorA, tensorB,
+                                          contracted_pairs, res_A_modes, res_B_modes,
+                                          blas_handle, stream);
 }
 
 
