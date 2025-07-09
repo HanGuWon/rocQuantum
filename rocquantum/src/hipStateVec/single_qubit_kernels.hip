@@ -1,5 +1,10 @@
 #include <hip/hip_runtime.h>
-#include "rocquantum/hipStateVec.h" // For rocComplex definition
+#include "rocquantum/hipStateVec.h" // For rocComplex, real_t definition
+
+// Constant memory for the 2x2 single-qubit matrix used by apply_single_qubit_generic_matrix_kernel
+// This matrix is copied here by the host before launching the kernel.
+// Only one such matrix can be "active" in constant memory at a time for this specific kernel.
+__constant__ rocComplex const_single_q_matrix[4];
 
 // Convention: Qubit 0 is the LSB.
 // For a single qubit gate on qubit 'targetQubit':
@@ -27,10 +32,10 @@ __device__ inline void apply_1q_matrix(rocComplex& amp0, rocComplex& amp1, const
 }
 
 // Generic kernel for applying an arbitrary 1-qubit unitary matrix
+// Matrix is read from __constant__ memory symbol const_single_q_matrix
 __global__ void apply_single_qubit_generic_matrix_kernel(rocComplex* state,
                                                          unsigned numQubits,
-                                                         unsigned targetQubit,
-                                                         const rocComplex* matrix) {
+                                                         unsigned targetQubit) { // Matrix parameter removed
     size_t N = 1ULL << numQubits;
     size_t k = 1ULL << targetQubit; // Stride between paired amplitudes
 
@@ -61,7 +66,8 @@ __global__ void apply_single_qubit_generic_matrix_kernel(rocComplex* state,
     if (idx1 < N) { // Ensure both indices are within bounds
         rocComplex amp0 = state[idx0];
         rocComplex amp1 = state[idx1];
-        apply_1q_matrix(amp0, amp1, matrix);
+        // apply_1q_matrix reads from const_single_q_matrix directly
+        apply_1q_matrix(amp0, amp1, const_single_q_matrix);
         state[idx0] = amp0;
         state[idx1] = amp1;
     }
@@ -113,12 +119,18 @@ __global__ void apply_Y_kernel(rocComplex* state, unsigned numQubits, unsigned t
         rocComplex amp1_old = state[idx1];
 
         // amp0_new = -i * amp1_old = {amp1_old.y, -amp1_old.x}
+#ifdef ROCQ_PRECISION_DOUBLE
         state[idx0].x = amp1_old.y;
         state[idx0].y = -amp1_old.x;
-
         // amp1_new = i * amp0_old = {-amp0_old.y, amp0_old.x}
         state[idx1].x = -amp0_old.y;
         state[idx1].y = amp0_old.x;
+#else
+        state[idx0].x = amp1_old.y;
+        state[idx0].y = -amp1_old.x;
+        state[idx1].x = -amp0_old.y;
+        state[idx1].y = amp0_old.x;
+#endif
     }
 }
 
@@ -149,7 +161,11 @@ __global__ void apply_H_kernel(rocComplex* state, unsigned numQubits, unsigned t
     // H = 1/sqrt(2) * [[1, 1], [1, -1]]
     // amp0_new = (amp0_old + amp1_old) / sqrt(2)
     // amp1_new = (amp0_old - amp1_old) / sqrt(2)
-    const float inv_sqrt2 = 1.0f / sqrtf(2.0f);
+#ifdef ROCQ_PRECISION_DOUBLE
+    const real_t inv_sqrt2 = 1.0 / sqrt(2.0);
+#else
+    const real_t inv_sqrt2 = 1.0f / sqrtf(2.0f);
+#endif
     size_t N = 1ULL << numQubits;
     size_t k = 1ULL << targetQubit;
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -191,8 +207,13 @@ __global__ void apply_S_kernel(rocComplex* state, unsigned numQubits, unsigned t
 
     if (idx1 < N) {
         rocComplex amp1_old = state[idx1];
+#ifdef ROCQ_PRECISION_DOUBLE
         state[idx1].x = -amp1_old.y;
         state[idx1].y = amp1_old.x;
+#else
+        state[idx1].x = -amp1_old.y;
+        state[idx1].y = amp1_old.x;
+#endif
     }
 }
 
@@ -200,8 +221,13 @@ __global__ void apply_S_kernel(rocComplex* state, unsigned numQubits, unsigned t
 __global__ void apply_T_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit) {
     // T = [[1, 0], [0, exp(i*pi/4)]]
     // exp(i*pi/4) = cos(pi/4) + i*sin(pi/4) = 1/sqrt(2) + i/sqrt(2)
-    const float val = 1.0f / sqrtf(2.0f);
-    rocComplex phase_factor = make_hipFloatComplex(val, val);
+#ifdef ROCQ_PRECISION_DOUBLE
+    const real_t val = 1.0 / sqrt(2.0);
+    rocComplex phase_factor = {val, val};
+#else
+    const real_t val = 1.0f / sqrtf(2.0f);
+    rocComplex phase_factor = {val, val};
+#endif
     
     size_t N = 1ULL << numQubits;
     size_t k = 1ULL << targetQubit;
@@ -222,16 +248,24 @@ __global__ void apply_T_kernel(rocComplex* state, unsigned numQubits, unsigned t
 }
 
 // Rx(theta) Gate
-__global__ void apply_Rx_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, float theta) {
+__global__ void apply_Rx_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, real_t theta) {
     // Rx(theta) = [[cos(t/2), -i*sin(t/2)], [-i*sin(t/2), cos(t/2)]]
     // M00 = cos(t/2), M01 = {0, -sin(t/2)}, M10 = {0, -sin(t/2)}, M11 = cos(t/2)
-    float cos_half_theta = cosf(theta / 2.0f);
-    float sin_half_theta = sinf(theta / 2.0f);
-
-    rocComplex M00 = make_hipFloatComplex(cos_half_theta, 0.0f);
-    rocComplex M01 = make_hipFloatComplex(0.0f, -sin_half_theta);
-    rocComplex M10 = make_hipFloatComplex(0.0f, -sin_half_theta);
-    rocComplex M11 = make_hipFloatComplex(cos_half_theta, 0.0f);
+#ifdef ROCQ_PRECISION_DOUBLE
+    real_t cos_half_theta = cos(theta / 2.0);
+    real_t sin_half_theta = sin(theta / 2.0);
+    rocComplex M00 = {cos_half_theta, 0.0};
+    rocComplex M01 = {0.0, -sin_half_theta};
+    rocComplex M10 = {0.0, -sin_half_theta};
+    rocComplex M11 = {cos_half_theta, 0.0};
+#else
+    real_t cos_half_theta = cosf(theta / 2.0f);
+    real_t sin_half_theta = sinf(theta / 2.0f);
+    rocComplex M00 = {cos_half_theta, 0.0f};
+    rocComplex M01 = {0.0f, -sin_half_theta};
+    rocComplex M10 = {0.0f, -sin_half_theta};
+    rocComplex M11 = {cos_half_theta, 0.0f};
+#endif
     
     // This can be directly passed to the generic kernel as well
     // For now, let's use the structure of other specialized kernels
@@ -259,16 +293,24 @@ __global__ void apply_Rx_kernel(rocComplex* state, unsigned numQubits, unsigned 
 }
 
 // Ry(theta) Gate
-__global__ void apply_Ry_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, float theta) {
+__global__ void apply_Ry_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, real_t theta) {
     // Ry(theta) = [[cos(t/2), -sin(t/2)], [sin(t/2), cos(t/2)]]
     // M00 = cos(t/2), M01 = -sin(t/2), M10 = sin(t/2), M11 = cos(t/2)
-    float cos_half_theta = cosf(theta / 2.0f);
-    float sin_half_theta = sinf(theta / 2.0f);
-
-    rocComplex M00 = make_hipFloatComplex(cos_half_theta, 0.0f);
-    rocComplex M01 = make_hipFloatComplex(-sin_half_theta, 0.0f);
-    rocComplex M10 = make_hipFloatComplex(sin_half_theta, 0.0f);
-    rocComplex M11 = make_hipFloatComplex(cos_half_theta, 0.0f);
+#ifdef ROCQ_PRECISION_DOUBLE
+    real_t cos_half_theta = cos(theta / 2.0);
+    real_t sin_half_theta = sin(theta / 2.0);
+    rocComplex M00 = {cos_half_theta, 0.0};
+    rocComplex M01 = {-sin_half_theta, 0.0};
+    rocComplex M10 = {sin_half_theta, 0.0};
+    rocComplex M11 = {cos_half_theta, 0.0};
+#else
+    real_t cos_half_theta = cosf(theta / 2.0f);
+    real_t sin_half_theta = sinf(theta / 2.0f);
+    rocComplex M00 = {cos_half_theta, 0.0f};
+    rocComplex M01 = {-sin_half_theta, 0.0f};
+    rocComplex M10 = {sin_half_theta, 0.0f};
+    rocComplex M11 = {cos_half_theta, 0.0f};
+#endif
 
     size_t N = 1ULL << numQubits;
     size_t k = 1ULL << targetQubit;
@@ -294,15 +336,21 @@ __global__ void apply_Ry_kernel(rocComplex* state, unsigned numQubits, unsigned 
 }
 
 // Rz(theta) Gate (Phase shift)
-__global__ void apply_Rz_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, float theta) {
+__global__ void apply_Rz_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, real_t theta) {
     // Rz(theta) = [[exp(-it/2), 0], [0, exp(it/2)]]
     // amp0_new = exp(-it/2) * amp0_old
     // amp1_new = exp(it/2) * amp1_old
-    float cos_half_theta = cosf(theta / 2.0f);
-    float sin_half_theta = sinf(theta / 2.0f);
-
-    rocComplex phase_neg = make_hipFloatComplex(cos_half_theta, -sin_half_theta); // e^(-it/2)
-    rocComplex phase_pos = make_hipFloatComplex(cos_half_theta, sin_half_theta);  // e^(it/2)
+#ifdef ROCQ_PRECISION_DOUBLE
+    real_t cos_half_theta = cos(theta / 2.0);
+    real_t sin_half_theta = sin(theta / 2.0);
+    rocComplex phase_neg = {cos_half_theta, -sin_half_theta}; // e^(-it/2)
+    rocComplex phase_pos = {cos_half_theta, sin_half_theta};  // e^(it/2)
+#else
+    real_t cos_half_theta = cosf(theta / 2.0f);
+    real_t sin_half_theta = sinf(theta / 2.0f);
+    rocComplex phase_neg = {cos_half_theta, -sin_half_theta}; // e^(-it/2)
+    rocComplex phase_pos = {cos_half_theta, sin_half_theta};  // e^(it/2)
+#endif
 
     size_t N = 1ULL << numQubits;
     size_t k = 1ULL << targetQubit;

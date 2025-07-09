@@ -12,7 +12,11 @@ __device__ inline void apply_small_matrix_local(rocComplex* local_amps,
 
     for (unsigned i = 0; i < matrix_dim; ++i) {
         temp_amps[i] = local_amps[i]; // Copy to temp array
-        local_amps[i] = make_hipFloatComplex(0.0f, 0.0f); // Zero out for accumulation
+#ifdef ROCQ_PRECISION_DOUBLE
+        local_amps[i] = {0.0, 0.0}; // Zero out for accumulation
+#else
+        local_amps[i] = {0.0f, 0.0f}; // Zero out for accumulation
+#endif
     }
 
     for (unsigned i = 0; i < matrix_dim; ++i) { // Output amplitude index

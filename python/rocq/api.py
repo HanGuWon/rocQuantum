@@ -282,4 +282,213 @@ class Circuit:
     #        print("Warning: 'run' method called with shots=1. Operations are applied eagerly. Consider using 'measure'.")
     #     raise NotImplementedError("'run' method with shots is not fully implemented for this eager execution model.")
 
+
+class PauliOperator:
+    """
+    Represents a Pauli operator as a sum of Pauli strings with coefficients.
+    Example: 0.5 * Z0 Z1 + 0.25 * X0 I1
+    """
+    def __init__(self, terms: dict[str, float] | str = None):
+        """
+        Args:
+            terms: A dictionary where keys are Pauli strings (e.g., "Z0 Z1", "X0")
+                   and values are their coefficients.
+                   Or a single string like "Z0 Z1" (coefficient 1.0).
+        """
+        self.terms: list[tuple[list[tuple[str, int]], float]] = [] # Canonical: [([(P,qidx),...], coeff), ...]
+
+        if terms is None:
+            return
+        if isinstance(terms, str):
+            self._add_pauli_string(terms, 1.0)
+        elif isinstance(terms, dict):
+            for pauli_str, coeff in terms.items():
+                self._add_pauli_string(pauli_str, coeff)
+        else:
+            raise TypeError("PauliOperator terms must be a dict or a single Pauli string.")
+
+    def _add_pauli_string(self, pauli_str: str, coeff: float):
+        """Parses a single Pauli string like "X0 Y1 Z2" and adds it."""
+        if not isinstance(pauli_str, str):
+            raise TypeError("Pauli string must be a string.")
+        if not isinstance(coeff, (float, int)):
+            raise TypeError("Coefficient must be a float or int.")
+
+        components = pauli_str.strip().upper().split()
+        if not components and pauli_str: # Non-empty string but no components after split (e.g. "I")
+             if pauli_str.strip().upper() == "I": # Global Identity
+                self.terms.append(([], float(coeff))) # Empty list of ops for Identity
+                return
+             else:
+                raise ValueError(f"Invalid Pauli string component: {pauli_str}")
+
+        parsed_ops = []
+        for comp in components:
+            if not comp: continue # Skip empty parts if there were multiple spaces
+
+            pauli_char = comp[0]
+            if pauli_char not in "IXYZ":
+                raise ValueError(f"Invalid Pauli type '{pauli_char}' in '{comp}'. Must be I, X, Y, or Z.")
+
+            try:
+                qubit_idx = int(comp[1:])
+                if qubit_idx < 0:
+                    raise ValueError("Qubit index cannot be negative.")
+            except ValueError:
+                raise ValueError(f"Invalid qubit index in '{comp}'. Must be an integer.")
+
+            # Don't add Identity if it's specified per qubit e.g. "I0 X1" -> just "X1"
+            if pauli_char != 'I':
+                parsed_ops.append((pauli_char, qubit_idx))
+
+        # Sort by qubit index for a canonical representation, though not strictly necessary for correctness here
+        # parsed_ops.sort(key=lambda x: x[1])
+        self.terms.append((parsed_ops, float(coeff)))
+
+    def __repr__(self):
+        if not self.terms:
+            return "PauliOperator(Empty)"
+        term_strs = []
+        for ops, coeff in self.terms:
+            if not ops: # Identity term
+                op_str = "I"
+            else:
+                op_str = " ".join([f"{p}{q}" for p, q in ops])
+            term_strs.append(f"{coeff} * [{op_str}]")
+        return "PauliOperator(\n  " + "\n+ ".join(term_strs) + "\n)"
+
+    def __add__(self, other):
+        if not isinstance(other, PauliOperator):
+            return NotImplemented
+        new_op = PauliOperator()
+        new_op.terms = self.terms + other.terms # Simple concatenation, could simplify later
+        return new_op
+
+    def __mul__(self, scalar: float):
+        if not isinstance(scalar, (float, int)):
+            return NotImplemented
+        new_op = PauliOperator()
+        new_op.terms = [(ops, coeff * float(scalar)) for ops, coeff in self.terms]
+        return new_op
+
+    def __rmul__(self, scalar: float):
+        return self.__mul__(scalar)
+
+
+# Global/module level functions for rocHybrid v0.1
+# These will eventually interact with a more sophisticated Program object and compiler.
+
+_current_circuit_for_kernel = None
+
+def kernel(func):
+    """
+    Decorator for quantum kernels.
+    For v0.1, this might not do much beyond marking the function.
+    In future, it would trigger AST introspection for MLIR conversion.
+    """
+    # For now, just return the function as is, or wrap it if needed for context.
+    # To make it work with the VQE example structure, the kernel needs to operate on a Circuit object.
+    # This implies the Circuit object needs to be available when the kernel is called.
+
+    # Let's try a simple approach: the kernel function will receive a Circuit object as its first argument.
+    # The @kernel decorator itself doesn't need to do much for v0.1 if build() handles creation.
+    return func
+
+
+def build(kernel_func, num_qubits: int, simulator: Simulator, *args) -> Circuit :
+    """
+    "Builds" a quantum program from a kernel function and its arguments.
+    For v0.1, this means:
+    1. Creating a Circuit instance.
+    2. Calling the kernel_func, passing the circuit and *args, allowing the kernel
+       to populate the circuit with gate operations.
+    """
+    if not isinstance(simulator, Simulator):
+        raise TypeError("A valid rocQ Simulator object is required for build.")
+
+    # For multi-GPU, circuit creation handles distributed state.
+    # We need to know if this build is for multi-GPU from simulator or an explicit flag.
+    # Assuming simulator handle already knows its GPU configuration.
+    # The Circuit constructor in api.py already takes a multi_gpu flag,
+    // but this is not easily known by build() unless passed explicitly or inferred from simulator.
+    # Let's assume the Circuit constructor handles this based on the simulator handle's state.
+    # For now, let's assume single GPU for simplicity of VQE v0.1 or pass it to build.
+
+    # The Circuit class already handles allocation and initialization.
+    qcircuit = Circuit(num_qubits, simulator) # Defaulting to single GPU unless Circuit infers from Simulator
+
+    # Allow the kernel function to define itself on the circuit
+    kernel_func(qcircuit, *args) # Pass circuit as first arg, then other params
+
+    return qcircuit
+
+
+def get_expval(circuit: Circuit, hamiltonian: PauliOperator) -> float:
+    """
+    Calculates the expectation value of a Hamiltonian with respect to the state
+    prepared by the circuit.
+    <psi|H|psi>
+    For v0.1, this will be simplified.
+    """
+    if not isinstance(circuit, Circuit):
+        raise TypeError("Input circuit must be a rocQ Circuit object.")
+    if not isinstance(hamiltonian, PauliOperator):
+        raise TypeError("Input hamiltonian must be a rocQ PauliOperator object.")
+
+    total_expval = 0.0
+
+    # For each term in the Hamiltonian (e.g., 0.5 * Z0Z1)
+    for pauli_ops_list, coeff in hamiltonian.terms:
+        if not pauli_ops_list: # Identity term
+            total_expval += coeff # <psi|I|psi> = coeff * <psi|psi> = coeff * 1.0
+            continue
+
+        # For v0.1, we only support single Pauli Z terms for direct expectation value calculation
+        # via a new backend function.
+        # Example: if pauli_ops_list = [('Z', 0)], calculate <Z0>
+        #          if pauli_ops_list = [('Z', 1)], calculate <Z1>
+        # More complex terms like "Z0 X1" are NOT YET SUPPORTED by this simplified get_expval.
+
+        term_expval = 1.0 # For products of Paulis, this would be more complex.
+                         # For now, we assume only terms like c_i * Z_k or c_j * X_k etc.
+                         # The PauliOperator structure allows for "Z0 X1", but this get_expval won't handle it yet.
+
+        if len(pauli_ops_list) == 1:
+            pauli_char, qubit_idx = pauli_ops_list[0]
+            if pauli_char == 'Z':
+                # This is where we'd call the backend function
+                # result_tuple = backend.get_expectation_value_single_pauli_z(circuit._sim_handle, circuit._d_state_buffer, circuit.num_qubits, qubit_idx)
+                # For now, this backend function doesn't exist.
+                # Placeholder: For VQE v0.1, we might need to implement this specific measurement.
+                # A Z expectation value is P(0) - P(1) for that qubit.
+                # We can use the existing measure function, but it collapses state.
+                # This is a critical point for the VQE.
+                # Let's assume a backend.get_expectation_value_z(handle, d_state, num_qubits, target_qubit) will exist.
+                try:
+                    exp_val_z_contrib = backend.get_expectation_value_z( # This function needs to be added to bindings
+                        circuit._sim_handle,
+                        circuit._get_d_state_for_backend(),
+                        circuit.num_qubits,
+                        qubit_idx
+                    )
+                    term_expval = exp_val_z_contrib
+                except AttributeError:
+                     raise NotImplementedError(
+                        "Backend function 'get_expectation_value_z' is not yet bound or implemented. "
+                        "VQE get_expval requires this for 'Z' terms."
+                    )
+                except RuntimeError as e:
+                    raise RuntimeError(f"Error calculating <{pauli_char}{qubit_idx}>: {e}")
+            else:
+                raise NotImplementedError(f"Expectation value for Pauli '{pauli_char}' not supported in v0.1 get_expval. Only 'Z' is.")
+        elif not pauli_ops_list: # Should have been caught by the (if not pauli_ops_list) above
+             pass # Identity, already handled
+        else:
+            # Product of Paulis, e.g., Z0 Z1
+            raise NotImplementedError("Expectation value for products of Paulis (e.g., 'Z0 Z1') not yet supported in v0.1 get_expval.")
+
+        total_expval += coeff * term_expval
+
+    return total_expval
+
 ```

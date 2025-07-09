@@ -90,16 +90,17 @@ static bool are_qubits_local(rocsvInternalHandle* h, const unsigned* qubitIndice
 
 // Kernel Forward Declarations
 __global__ void initializeToZeroStateKernel(rocComplex* state, size_t num_elements);
-__global__ void apply_single_qubit_generic_matrix_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, const rocComplex* matrixDevice);
+// Updated declaration for generic single qubit kernel (reads from __constant__ memory)
+__global__ void apply_single_qubit_generic_matrix_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit);
 __global__ void apply_X_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit);
 __global__ void apply_Y_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit);
 __global__ void apply_Z_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit);
 __global__ void apply_H_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit);
 __global__ void apply_S_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit);
 __global__ void apply_T_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit);
-__global__ void apply_Rx_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, float theta);
-__global__ void apply_Ry_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, float theta);
-__global__ void apply_Rz_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, float theta);
+__global__ void apply_Rx_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, real_t theta); // Uses real_t
+__global__ void apply_Ry_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, real_t theta); // Uses real_t
+__global__ void apply_Rz_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, real_t theta); // Uses real_t
 
 __global__ void apply_two_qubit_generic_matrix_kernel(rocComplex* state, unsigned numQubits, unsigned qubit0_idx, unsigned qubit1_idx, const rocComplex* matrixDevice);
 __global__ void apply_CNOT_kernel(rocComplex* state, unsigned numQubits, unsigned controlQubit_idx, unsigned targetQubit_idx);
@@ -293,7 +294,7 @@ rocqStatus_t rocsvInitializeState(rocsvHandle_t handle, rocComplex* d_state, uns
     hipError_t err = hipMemsetAsync(internal_handle->d_local_state_slices[0], 0, num_elements * sizeof(rocComplex), internal_handle->streams[0]);
     if (err != hipSuccess) return checkHipError(err, "rocsvInitializeState hipMemsetAsync");
     if (num_elements > 0) { 
-        rocComplex zero_state_amplitude = make_hipFloatComplex(1.0f, 0.0f);
+        rocComplex zero_state_amplitude = {1.0, 0.0}; // Will be float or double based on rocComplex typedef
         err = hipMemcpyAsync(internal_handle->d_local_state_slices[0], &zero_state_amplitude, sizeof(rocComplex), hipMemcpyHostToDevice, internal_handle->streams[0]);
         if (err != hipSuccess) return checkHipError(err, "rocsvInitializeState hipMemcpyAsync for first element");
     }
@@ -320,11 +321,11 @@ rocqStatus_t rocsvInitializeDistributedState(rocsvHandle_t handle) {
         hipError_t hip_err_set_dev0 = hipSetDevice(internal_handle->deviceIds[0]);
         if (hip_err_set_dev0 != hipSuccess) return checkHipError(hip_err_set_dev0, "rocsvInitializeDistributedState hipSetDevice for dev0");
         if (internal_handle->d_local_state_slices[0] != nullptr && internal_handle->localStateSizes[0] > 0) {
-            rocComplex zero_state_amplitude = make_hipFloatComplex(1.0f, 0.0f);
+            rocComplex zero_state_amplitude = {1.0, 0.0}; // Will be float or double based on rocComplex typedef
             hipError_t hip_err_memcpy = hipMemcpyAsync(internal_handle->d_local_state_slices[0], &zero_state_amplitude, sizeof(rocComplex), hipMemcpyHostToDevice, internal_handle->streams[0]);
             if (hip_err_memcpy != hipSuccess) return checkHipError(hip_err_memcpy, "rocsvInitializeDistributedState hipMemcpyAsync for zero state");
         } else if (is_zero_qubit_single_gpu_case && internal_handle->d_local_state_slices[0] != nullptr && internal_handle->localStateSizes[0] == 1) {
-             rocComplex zero_state_amplitude = make_hipFloatComplex(1.0f, 0.0f);
+             rocComplex zero_state_amplitude = {1.0, 0.0}; // Will be float or double based on rocComplex typedef
              hipError_t hip_err_memcpy = hipMemcpyAsync(internal_handle->d_local_state_slices[0], &zero_state_amplitude, sizeof(rocComplex), hipMemcpyHostToDevice, internal_handle->streams[0]);
             if (hip_err_memcpy != hipSuccess) return checkHipError(hip_err_memcpy, "rocsvInitializeDistributedState hipMemcpyAsync for 0-qubit state");
         }
@@ -369,12 +370,18 @@ rocqStatus_t rocsvApplyMatrix(rocsvHandle_t handle, rocComplex* d_state_legacy, 
             unsigned* d_target_indices_gpu = nullptr;
             if (numTargetQubits == 1) {
                 unsigned targetQubitLocal = local_qubit_indices_vec[0];
+                // Copy matrix to constant memory for single-qubit generic kernel
+                // Assuming 'const_single_q_matrix' is the symbol name in single_qubit_kernels.hip
+                hipError_t cpy_sym_err = hipMemcpyToSymbolAsync(HIP_SYMBOL(const_single_q_matrix), matrixDevice, 4 * sizeof(rocComplex), 0, hipMemcpyDeviceToDevice, h->streams[rank]);
+                if (cpy_sym_err != hipSuccess) { status = ROCQ_STATUS_HIP_ERROR; break; }
+
                 size_t num_thread_groups = (local_slice_num_elements > 0) ? local_slice_num_elements / 2 : 0;
                 unsigned num_blocks = (num_thread_groups + threads_per_block - 1) / threads_per_block;
                 if (num_thread_groups > 0 && num_blocks == 0) num_blocks = 1;
                 else if (num_thread_groups == 0) { if (local_num_qubits_for_kernel == 0 && targetQubitLocal == 0 && local_slice_num_elements == 1) num_blocks = 0; else num_blocks = 0;}
+
                 if (num_blocks > 0 && h->localStateSizes[rank] > 0) {
-                    hipLaunchKernelGGL(apply_single_qubit_generic_matrix_kernel, dim3(num_blocks), dim3(threads_per_block), 0, h->streams[rank], current_local_slice_ptr, local_num_qubits_for_kernel, targetQubitLocal, matrixDevice);
+                    hipLaunchKernelGGL(apply_single_qubit_generic_matrix_kernel, dim3(num_blocks), dim3(threads_per_block), 0, h->streams[rank], current_local_slice_ptr, local_num_qubits_for_kernel, targetQubitLocal); // matrixDevice removed
                     if (hipGetLastError() != hipSuccess) { status = ROCQ_STATUS_HIP_ERROR; break;}
                 }
             } else if (numTargetQubits == 2) {
@@ -503,8 +510,8 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
         if (d_state != nullptr && d_state != current_d_state_slice) return ROCQ_STATUS_INVALID_VALUE;
         if (numQubits != current_global_qubits) return ROCQ_STATUS_INVALID_VALUE;
 
-        double h_prob0_sum_slice = 0.0;
-        double h_prob1_sum_slice = 0.0;
+        real_t h_prob0_sum_slice_rt = 0.0; // Use real_t for internal calcs
+        real_t h_prob1_sum_slice_rt = 0.0;
 
         unsigned num_kernel_blocks = 0;
         if (slice_num_elements > 0) {
@@ -513,10 +520,10 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
         }
 
         if (num_kernel_blocks > 0) {
-            double* d_block_probs = nullptr;
-            hipMalloc(&d_block_probs, num_kernel_blocks * 2 * sizeof(double));
-            hipMemsetAsync(d_block_probs, 0, num_kernel_blocks * 2 * sizeof(double), current_stream);
-            size_t shared_mem_size = KERNEL_BLOCK_SIZE * 2 * sizeof(double);
+            real_t* d_block_probs = nullptr;
+            hipMalloc(&d_block_probs, num_kernel_blocks * 2 * sizeof(real_t));
+            hipMemsetAsync(d_block_probs, 0, num_kernel_blocks * 2 * sizeof(real_t), current_stream);
+            size_t shared_mem_size = KERNEL_BLOCK_SIZE * 2 * sizeof(real_t);
             hipLaunchKernelGGL(calculate_local_slice_probabilities_kernel,
                                dim3(num_kernel_blocks), dim3(KERNEL_BLOCK_SIZE), shared_mem_size, current_stream,
                                current_d_state_slice, slice_num_elements,
@@ -524,45 +531,45 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
                                d_block_probs);
             if (hipGetLastError() != hipSuccess) { if(d_block_probs) hipFree(d_block_probs); return ROCQ_STATUS_HIP_ERROR; }
 
-            double* d_slice_probs_out = nullptr;
-            hipMalloc(&d_slice_probs_out, 2 * sizeof(double));
-            hipMemsetAsync(d_slice_probs_out, 0, 2*sizeof(double), current_stream);
+            real_t* d_slice_probs_out = nullptr;
+            hipMalloc(&d_slice_probs_out, 2 * sizeof(real_t));
+            hipMemsetAsync(d_slice_probs_out, 0, 2*sizeof(real_t), current_stream);
 
             unsigned num_blocks_final_reduction = (num_kernel_blocks + KERNEL_BLOCK_SIZE - 1) / KERNEL_BLOCK_SIZE;
             if(num_blocks_final_reduction == 0 && num_kernel_blocks > 0) num_blocks_final_reduction = 1;
 
             if(num_blocks_final_reduction > 0) {
                 hipLaunchKernelGGL(reduce_block_sums_to_slice_total_probs_kernel,
-                                dim3(num_blocks_final_reduction), dim3(KERNEL_BLOCK_SIZE), KERNEL_BLOCK_SIZE * 2 * sizeof(double), current_stream,
+                                dim3(num_blocks_final_reduction), dim3(KERNEL_BLOCK_SIZE), KERNEL_BLOCK_SIZE * 2 * sizeof(real_t), current_stream,
                                 d_block_probs, num_kernel_blocks, d_slice_probs_out);
                 if (hipGetLastError() != hipSuccess) { hipFree(d_block_probs); hipFree(d_slice_probs_out); return ROCQ_STATUS_HIP_ERROR; }
             }
 
-            double h_slice_probs[2];
-            hipMemcpy(h_slice_probs, d_slice_probs_out, 2 * sizeof(double), hipMemcpyDeviceToHost);
-            h_prob0_sum_slice = h_slice_probs[0];
-            h_prob1_sum_slice = h_slice_probs[1];
+            real_t h_slice_probs_rt[2];
+            hipMemcpy(h_slice_probs_rt, d_slice_probs_out, 2 * sizeof(real_t), hipMemcpyDeviceToHost);
+            h_prob0_sum_slice_rt = h_slice_probs_rt[0];
+            h_prob1_sum_slice_rt = h_slice_probs_rt[1];
             if(d_block_probs) hipFree(d_block_probs);
             if(d_slice_probs_out) hipFree(d_slice_probs_out);
 
         } else if (num_qubits_in_slice == 0 && qubitToMeasure == 0 && slice_num_elements == 1) {
             rocComplex h_amp;
             hipMemcpy(&h_amp, current_d_state_slice, sizeof(rocComplex), hipMemcpyDeviceToHost);
-            h_prob0_sum_slice = (double)h_amp.x * h_amp.x + (double)h_amp.y * h_amp.y;
-            h_prob1_sum_slice = 0.0;
+            h_prob0_sum_slice_rt = (real_t)h_amp.x * h_amp.x + (real_t)h_amp.y * h_amp.y;
+            h_prob1_sum_slice_rt = 0.0;
         }
 
-        double prob0 = h_prob0_sum_slice;
-        double prob1 = h_prob1_sum_slice;
+        double prob0 = static_cast<double>(h_prob0_sum_slice_rt); // Cast to double for API
+        double prob1 = static_cast<double>(h_prob1_sum_slice_rt);
         double total_prob_check_s = prob0 + prob1;
 
-        if (fabs(total_prob_check_s) < 1e-12) { prob0 = 0.5; prob1 = 0.5;}
-        else if (fabs(total_prob_check_s - 1.0) > 1e-9) { prob0 /= total_prob_check_s; prob1 = 1.0 - prob0;}
+        if (fabs(total_prob_check_s) < REAL_EPSILON * 100) { prob0 = 0.5; prob1 = 0.5;} // Use REAL_EPSILON
+        else if (fabs(total_prob_check_s - 1.0) > REAL_EPSILON * 100) { prob0 /= total_prob_check_s; prob1 = 1.0 - prob0;}
         if (prob0 < 0.0) prob0 = 0.0; if (prob0 > 1.0) prob0 = 1.0;
         prob1 = 1.0 - prob0;
 
         static bool seeded_s = false; if (!seeded_s) { srand((unsigned int)time(NULL)+1); seeded_s = true; }
-        double rand_val_s = (double)rand() / RAND_MAX;
+        double rand_val_s = (double)rand() / RAND_MAX; // rand() is fine for this purpose
 
         if (rand_val_s < prob0) { *h_outcome = 0; *h_probability = prob0; }
         else { *h_outcome = 1; *h_probability = prob1; }
@@ -577,7 +584,7 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
             if (hipGetLastError() != hipSuccess) return ROCQ_STATUS_HIP_ERROR;
         }
 
-        double h_sum_sq_mag_s = 0.0;
+        real_t h_sum_sq_mag_s_rt = 0.0; // Use real_t
         unsigned num_kernel_blocks_ssq = 0;
         if (slice_num_elements > 0) {
             num_kernel_blocks_ssq = (slice_num_elements + KERNEL_BLOCK_SIZE -1) / KERNEL_BLOCK_SIZE;
@@ -585,42 +592,42 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
         }
 
         if (num_kernel_blocks_ssq > 0) {
-            double* d_block_ssq_s = nullptr;
-            hipMalloc(&d_block_ssq_s, num_kernel_blocks_ssq * sizeof(double));
-            hipMemsetAsync(d_block_ssq_s, 0, num_kernel_blocks_ssq * sizeof(double), current_stream);
-            size_t shared_mem_size_ssq = KERNEL_BLOCK_SIZE * sizeof(double);
+            real_t* d_block_ssq_s = nullptr;
+            hipMalloc(&d_block_ssq_s, num_kernel_blocks_ssq * sizeof(real_t));
+            hipMemsetAsync(d_block_ssq_s, 0, num_kernel_blocks_ssq * sizeof(real_t), current_stream);
+            size_t shared_mem_size_ssq = KERNEL_BLOCK_SIZE * sizeof(real_t);
             hipLaunchKernelGGL(calculate_local_slice_sum_sq_mag_kernel,
                            dim3(num_kernel_blocks_ssq), dim3(KERNEL_BLOCK_SIZE), shared_mem_size_ssq, current_stream,
                            current_d_state_slice, slice_num_elements, d_block_ssq_s);
             if (hipGetLastError() != hipSuccess) { if(d_block_ssq_s) hipFree(d_block_ssq_s); return ROCQ_STATUS_HIP_ERROR; }
 
-            double* d_slice_ssq_out = nullptr;
-            hipMalloc(&d_slice_ssq_out, sizeof(double));
-            hipMemsetAsync(d_slice_ssq_out, 0, sizeof(double), current_stream);
+            real_t* d_slice_ssq_out = nullptr;
+            hipMalloc(&d_slice_ssq_out, sizeof(real_t));
+            hipMemsetAsync(d_slice_ssq_out, 0, sizeof(real_t), current_stream);
 
             unsigned num_blocks_final_ssq_reduc = (num_kernel_blocks_ssq + KERNEL_BLOCK_SIZE-1) / KERNEL_BLOCK_SIZE;
             if(num_blocks_final_ssq_reduc == 0 && num_kernel_blocks_ssq > 0) num_blocks_final_ssq_reduc = 1;
 
             if(num_blocks_final_ssq_reduc > 0){
                 hipLaunchKernelGGL(reduce_block_sums_to_slice_total_sum_sq_mag_kernel,
-                                dim3(num_blocks_final_ssq_reduc), dim3(KERNEL_BLOCK_SIZE), KERNEL_BLOCK_SIZE * sizeof(double), current_stream,
+                                dim3(num_blocks_final_ssq_reduc), dim3(KERNEL_BLOCK_SIZE), KERNEL_BLOCK_SIZE * sizeof(real_t), current_stream,
                                 d_block_ssq_s, num_kernel_blocks_ssq, d_slice_ssq_out);
                 if (hipGetLastError() != hipSuccess) { hipFree(d_block_ssq_s); hipFree(d_slice_ssq_out); return ROCQ_STATUS_HIP_ERROR; }
             }
-            hipMemcpy(&h_sum_sq_mag_s, d_slice_ssq_out, sizeof(double), hipMemcpyDeviceToHost);
+            hipMemcpy(&h_sum_sq_mag_s_rt, d_slice_ssq_out, sizeof(real_t), hipMemcpyDeviceToHost);
             if(d_block_ssq_s) hipFree(d_block_ssq_s);
             if(d_slice_ssq_out) hipFree(d_slice_ssq_out);
         } else if (slice_num_elements == 1) {
              rocComplex h_amp_collapsed;
              hipMemcpy(&h_amp_collapsed, current_d_state_slice, sizeof(rocComplex), hipMemcpyDeviceToHost);
-             h_sum_sq_mag_s = (double)h_amp_collapsed.x * h_amp_collapsed.x + (double)h_amp_collapsed.y * h_amp_collapsed.y;
+             h_sum_sq_mag_s_rt = (real_t)h_amp_collapsed.x * h_amp_collapsed.x + (real_t)h_amp_collapsed.y * h_amp_collapsed.y;
         }
 
-        if (fabs(h_sum_sq_mag_s) > 1e-12) {
-            double norm_factor = 1.0 / sqrt(fabs(h_sum_sq_mag_s));
+        if (fabs(static_cast<double>(h_sum_sq_mag_s_rt)) > REAL_EPSILON * 100) { // Compare with REAL_EPSILON
+            real_t norm_factor_rt = 1.0 / sqrt(fabs(h_sum_sq_mag_s_rt));
             if (num_blocks_m > 0 && slice_num_elements > 0) {
                 hipLaunchKernelGGL(renormalize_state_kernel, dim3(num_blocks_m), dim3(threads_per_block_m), 0, current_stream,
-                                   current_d_state_slice, num_qubits_in_slice, norm_factor);
+                                   current_d_state_slice, num_qubits_in_slice, norm_factor_rt); // Pass real_t
                 if (hipGetLastError() != hipSuccess) return ROCQ_STATUS_HIP_ERROR;
             }
         }
@@ -634,10 +641,10 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
     }
     unsigned local_target_qubit = qubitToMeasure;
 
-    double global_prob0 = 0.0;
-    double global_prob1 = 0.0;
+    real_t global_prob0_rt = 0.0; // Use real_t
+    real_t global_prob1_rt = 0.0;
 
-    std::vector<double*> d_slice_probs_all_gpus(h->numGpus, nullptr);
+    std::vector<real_t*> d_slice_probs_all_gpus(h->numGpus, nullptr); // Store real_t pointers
 
     for (int i = 0; i < h->numGpus; ++i) {
         hipSetDevice(h->deviceIds[i]);
@@ -647,11 +654,11 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
         if (num_kernel_blocks_stage1 == 0 && h->localStateSizes[i] > 0) num_kernel_blocks_stage1 = 1;
         if (num_kernel_blocks_stage1 == 0) continue;
 
-        double* d_block_partial_probs_gpu_i = nullptr;
-        hipMalloc(&d_block_partial_probs_gpu_i, num_kernel_blocks_stage1 * 2 * sizeof(double));
-        hipMemsetAsync(d_block_partial_probs_gpu_i, 0, num_kernel_blocks_stage1 * 2 * sizeof(double), h->streams[i]);
+        real_t* d_block_partial_probs_gpu_i = nullptr;
+        hipMalloc(&d_block_partial_probs_gpu_i, num_kernel_blocks_stage1 * 2 * sizeof(real_t));
+        hipMemsetAsync(d_block_partial_probs_gpu_i, 0, num_kernel_blocks_stage1 * 2 * sizeof(real_t), h->streams[i]);
 
-        size_t shared_mem_size_stage1 = KERNEL_BLOCK_SIZE * 2 * sizeof(double);
+        size_t shared_mem_size_stage1 = KERNEL_BLOCK_SIZE * 2 * sizeof(real_t);
         hipLaunchKernelGGL(calculate_local_slice_probabilities_kernel,
                            dim3(num_kernel_blocks_stage1), dim3(KERNEL_BLOCK_SIZE), shared_mem_size_stage1, h->streams[i],
                            h->d_local_state_slices[i], h->localStateSizes[i],
@@ -659,15 +666,15 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
                            d_block_partial_probs_gpu_i);
         if (hipGetLastError() != hipSuccess) { status = ROCQ_STATUS_HIP_ERROR; if(d_block_partial_probs_gpu_i) hipFree(d_block_partial_probs_gpu_i); goto mgpu_measure_cleanup_probs_rccl; }
 
-        hipMalloc(&d_slice_probs_all_gpus[i], 2 * sizeof(double));
-        hipMemsetAsync(d_slice_probs_all_gpus[i], 0, 2 * sizeof(double), h->streams[i]);
+        hipMalloc(&d_slice_probs_all_gpus[i], 2 * sizeof(real_t));
+        hipMemsetAsync(d_slice_probs_all_gpus[i], 0, 2 * sizeof(real_t), h->streams[i]);
 
         unsigned num_kernel_blocks_stage2 = (num_kernel_blocks_stage1 + KERNEL_BLOCK_SIZE - 1) / KERNEL_BLOCK_SIZE;
         if (num_kernel_blocks_stage2 == 0 && num_kernel_blocks_stage1 > 0) num_kernel_blocks_stage2 = 1;
 
         if (num_kernel_blocks_stage2 > 0) {
              hipLaunchKernelGGL(reduce_block_sums_to_slice_total_probs_kernel,
-                               dim3(num_kernel_blocks_stage2), dim3(KERNEL_BLOCK_SIZE), KERNEL_BLOCK_SIZE * 2 * sizeof(double), h->streams[i],
+                               dim3(num_kernel_blocks_stage2), dim3(KERNEL_BLOCK_SIZE), KERNEL_BLOCK_SIZE * 2 * sizeof(real_t), h->streams[i],
                                d_block_partial_probs_gpu_i, num_kernel_blocks_stage1, d_slice_probs_all_gpus[i]);
             if (hipGetLastError() != hipSuccess) { status = ROCQ_STATUS_HIP_ERROR; if(d_block_partial_probs_gpu_i) hipFree(d_block_partial_probs_gpu_i); goto mgpu_measure_cleanup_probs_rccl; }
         }
@@ -681,11 +688,13 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
         hipStreamSynchronize(h->streams[i]);
     }
 
+    rcclDataType_t rccl_type = (sizeof(real_t) == sizeof(float)) ? rcclFloat : rcclDouble;
+
     rcclGroupStart();
     for (int i = 0; i < h->numGpus; ++i) {
         hipSetDevice(h->deviceIds[i]);
         if (h->localStateSizes[i] == 0 || d_slice_probs_all_gpus[i] == nullptr) continue;
-        rcclAllReduce(d_slice_probs_all_gpus[i], d_slice_probs_all_gpus[i], 2, rcclDouble, rcclSum, h->comms[i], h->streams[i]);
+        rcclAllReduce(d_slice_probs_all_gpus[i], d_slice_probs_all_gpus[i], 2, rccl_type, rcclSum, h->comms[i], h->streams[i]);
     }
     rcclGroupEnd();
 
@@ -696,7 +705,7 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
     }
      if(status != ROCQ_STATUS_SUCCESS) goto mgpu_measure_cleanup_probs_rccl;
 
-    double h_global_probs[2] = {0.0, 0.0};
+    real_t h_global_probs_rt[2] = {0.0, 0.0};
     int first_participating_gpu = -1;
     for(int i=0; i < h->numGpus; ++i) {
         if (d_slice_probs_all_gpus[i] != nullptr) {
@@ -706,23 +715,26 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
     }
     if (first_participating_gpu != -1) {
         hipSetDevice(h->deviceIds[first_participating_gpu]);
-        hipMemcpy(&h_global_probs[0], d_slice_probs_all_gpus[first_participating_gpu], 2 * sizeof(double), hipMemcpyDeviceToHost);
-        global_prob0 = h_global_probs[0];
-        global_prob1 = h_global_probs[1];
+        hipMemcpy(&h_global_probs_rt[0], d_slice_probs_all_gpus[first_participating_gpu], 2 * sizeof(real_t), hipMemcpyDeviceToHost);
+        global_prob0_rt = h_global_probs_rt[0];
+        global_prob1_rt = h_global_probs_rt[1];
     }
 
 mgpu_measure_cleanup_probs_rccl:
     for(int i=0; i<h->numGpus; ++i) if(d_slice_probs_all_gpus[i]) { hipSetDevice(h->deviceIds[i]); hipFree(d_slice_probs_all_gpus[i]); d_slice_probs_all_gpus[i] = nullptr;}
     if(status != ROCQ_STATUS_SUCCESS) return status;
 
+    double global_prob0 = static_cast<double>(global_prob0_rt); // Cast to double for API
+    double global_prob1 = static_cast<double>(global_prob1_rt);
     double total_prob_check_m = global_prob0 + global_prob1;
-    if (fabs(total_prob_check_m) < 1e-12) { global_prob0 = 0.5; global_prob1 = 0.5;}
-    else if (fabs(total_prob_check_m - 1.0) > 1e-9) { global_prob0 /= total_prob_check_m; global_prob1 = 1.0 - global_prob0;}
+
+    if (fabs(total_prob_check_m) < REAL_EPSILON * 100) { global_prob0 = 0.5; global_prob1 = 0.5;}
+    else if (fabs(total_prob_check_m - 1.0) > REAL_EPSILON * 100) { global_prob0 /= total_prob_check_m; global_prob1 = 1.0 - global_prob0;}
     if (global_prob0 < 0.0) global_prob0 = 0.0; if (global_prob0 > 1.0) global_prob0 = 1.0;
     global_prob1 = 1.0 - global_prob0;
 
     static bool seeded_m = false; if (!seeded_m) { srand((unsigned int)time(NULL)+2); seeded_m = true; }
-    double rand_val_m = (double)rand() / RAND_MAX;
+    double rand_val_m = (double)rand() / RAND_MAX; // rand() is fine
 
     if (rand_val_m < global_prob0) { *h_outcome = 0; *h_probability = global_prob0; }
     else { *h_outcome = 1; *h_probability = global_prob1; }
@@ -745,8 +757,8 @@ mgpu_measure_cleanup_probs_rccl:
     }
     if(status != ROCQ_STATUS_SUCCESS) goto mgpu_measure_cleanup_renorm_rccl;
 
-    double global_sum_sq_mag_collapsed = 0.0;
-    std::vector<double*> d_slice_sum_sq_mag_all_gpus(h->numGpus, nullptr);
+    real_t global_sum_sq_mag_collapsed_rt = 0.0; // Use real_t
+    std::vector<real_t*> d_slice_sum_sq_mag_all_gpus(h->numGpus, nullptr); // Store real_t pointers
 
     for (int i = 0; i < h->numGpus; ++i) {
         hipSetDevice(h->deviceIds[i]);
@@ -755,23 +767,23 @@ mgpu_measure_cleanup_probs_rccl:
         if (num_kernel_blocks_s1 == 0 && h->localStateSizes[i] > 0) num_kernel_blocks_s1 = 1;
         if (num_kernel_blocks_s1 == 0) continue;
 
-        double* d_block_ssq_gpu_i = nullptr;
-        hipMalloc(&d_block_ssq_gpu_i, num_kernel_blocks_s1 * sizeof(double));
-        hipMemsetAsync(d_block_ssq_gpu_i, 0, num_kernel_blocks_s1 * sizeof(double), h->streams[i]);
-        size_t shared_mem_size_ssq = KERNEL_BLOCK_SIZE * sizeof(double);
+        real_t* d_block_ssq_gpu_i = nullptr;
+        hipMalloc(&d_block_ssq_gpu_i, num_kernel_blocks_s1 * sizeof(real_t));
+        hipMemsetAsync(d_block_ssq_gpu_i, 0, num_kernel_blocks_s1 * sizeof(real_t), h->streams[i]);
+        size_t shared_mem_size_ssq = KERNEL_BLOCK_SIZE * sizeof(real_t);
         hipLaunchKernelGGL(calculate_local_slice_sum_sq_mag_kernel,
                            dim3(num_kernel_blocks_s1), dim3(KERNEL_BLOCK_SIZE), shared_mem_size_ssq, h->streams[i],
                            h->d_local_state_slices[i], h->localStateSizes[i], d_block_ssq_gpu_i);
         if(hipGetLastError() != hipSuccess) {status = ROCQ_STATUS_HIP_ERROR; if(d_block_ssq_gpu_i) hipFree(d_block_ssq_gpu_i); goto mgpu_measure_cleanup_renorm_rccl;}
 
-        hipMalloc(&d_slice_sum_sq_mag_all_gpus[i], sizeof(double));
-        hipMemsetAsync(d_slice_sum_sq_mag_all_gpus[i], 0, sizeof(double), h->streams[i]);
+        hipMalloc(&d_slice_sum_sq_mag_all_gpus[i], sizeof(real_t));
+        hipMemsetAsync(d_slice_sum_sq_mag_all_gpus[i], 0, sizeof(real_t), h->streams[i]);
         unsigned num_kernel_blocks_s2 = (num_kernel_blocks_s1 + KERNEL_BLOCK_SIZE - 1) / KERNEL_BLOCK_SIZE;
         if(num_kernel_blocks_s2 == 0 && num_kernel_blocks_s1 > 0) num_kernel_blocks_s2 = 1;
 
         if(num_kernel_blocks_s2 > 0) {
             hipLaunchKernelGGL(reduce_block_sums_to_slice_total_sum_sq_mag_kernel,
-                            dim3(num_kernel_blocks_s2), dim3(KERNEL_BLOCK_SIZE), KERNEL_BLOCK_SIZE * sizeof(double), h->streams[i],
+                            dim3(num_kernel_blocks_s2), dim3(KERNEL_BLOCK_SIZE), KERNEL_BLOCK_SIZE * sizeof(real_t), h->streams[i],
                             d_block_ssq_gpu_i, num_kernel_blocks_s1, d_slice_sum_sq_mag_all_gpus[i]);
             if(hipGetLastError() != hipSuccess) {status = ROCQ_STATUS_HIP_ERROR; if(d_block_ssq_gpu_i) hipFree(d_block_ssq_gpu_i); goto mgpu_measure_cleanup_renorm_rccl;}
         }
@@ -789,7 +801,7 @@ mgpu_measure_cleanup_probs_rccl:
     for (int i = 0; i < h->numGpus; ++i) {
         hipSetDevice(h->deviceIds[i]);
         if (h->localStateSizes[i] == 0 || d_slice_sum_sq_mag_all_gpus[i] == nullptr) continue;
-        rcclAllReduce(d_slice_sum_sq_mag_all_gpus[i], d_slice_sum_sq_mag_all_gpus[i], 1, rcclDouble, rcclSum, h->comms[i], h->streams[i]);
+        rcclAllReduce(d_slice_sum_sq_mag_all_gpus[i], d_slice_sum_sq_mag_all_gpus[i], 1, rccl_type, rcclSum, h->comms[i], h->streams[i]);
     }
     rcclGroupEnd();
     for (int i = 0; i < h->numGpus; ++i) { // Sync AllReduce
@@ -808,17 +820,17 @@ mgpu_measure_cleanup_probs_rccl:
     }
     if (first_participating_gpu != -1) {
         hipSetDevice(h->deviceIds[first_participating_gpu]);
-        hipMemcpy(&global_sum_sq_mag_collapsed, d_slice_sum_sq_mag_all_gpus[first_participating_gpu], sizeof(double), hipMemcpyDeviceToHost);
+        hipMemcpy(&global_sum_sq_mag_collapsed_rt, d_slice_sum_sq_mag_all_gpus[first_participating_gpu], sizeof(real_t), hipMemcpyDeviceToHost);
     } else {
-        global_sum_sq_mag_collapsed = 0.0;
+        global_sum_sq_mag_collapsed_rt = 0.0;
     }
 
 mgpu_measure_cleanup_renorm_rccl:
     for(int i=0; i<h->numGpus; ++i) if(d_slice_sum_sq_mag_all_gpus[i]) {hipSetDevice(h->deviceIds[i]); hipFree(d_slice_sum_sq_mag_all_gpus[i]); d_slice_sum_sq_mag_all_gpus[i] = nullptr;}
     if(status != ROCQ_STATUS_SUCCESS) return status;
 
-    if (fabs(global_sum_sq_mag_collapsed) > 1e-12) {
-        double norm_factor = 1.0 / sqrt(fabs(global_sum_sq_mag_collapsed));
+    if (fabs(static_cast<double>(global_sum_sq_mag_collapsed_rt)) > REAL_EPSILON * 100) { // Compare with REAL_EPSILON
+        real_t norm_factor_rt = 1.0 / sqrt(fabs(global_sum_sq_mag_collapsed_rt));
         for (int i = 0; i < h->numGpus; ++i) {
             hipSetDevice(h->deviceIds[i]);
             if (h->localStateSizes[i] == 0) continue;
@@ -826,7 +838,7 @@ mgpu_measure_cleanup_renorm_rccl:
             if (num_blocks_renorm == 0 && h->localStateSizes[i] > 0) num_blocks_renorm = 1;
             if (num_blocks_renorm > 0) {
                 hipLaunchKernelGGL(renormalize_state_kernel, dim3(num_blocks_renorm), dim3(KERNEL_BLOCK_SIZE), 0, h->streams[i],
-                                   h->d_local_state_slices[i], h->numLocalQubitsPerGpu, norm_factor);
+                                   h->d_local_state_slices[i], h->numLocalQubitsPerGpu, norm_factor_rt); // Pass real_t
                  if(hipGetLastError() != hipSuccess) {status = ROCQ_STATUS_HIP_ERROR; goto mgpu_measure_final_sync_rccl;}
             }
         }
@@ -850,6 +862,184 @@ mgpu_measure_final_sync_rccl:
 // ... rocsvSwapIndexBits ...
 // ... Host-side helper functions ...
 
+rocqStatus_t rocsvGetExpectationValueSinglePauliZ(rocsvHandle_t handle,
+                                                  rocComplex* d_state_legacy, // Legacy for single GPU, ignored for multi-GPU
+                                                  unsigned numQubits_param,
+                                                  unsigned targetQubit,
+                                                  double* h_result) {
+    if (!handle || !h_result) return ROCQ_STATUS_INVALID_VALUE;
+    rocsvInternalHandle* h = static_cast<rocsvInternalHandle*>(handle);
+    rocqStatus_t status = ROCQ_STATUS_SUCCESS;
+
+    if (h->numGpus == 0) return ROCQ_STATUS_FAILURE;
+    unsigned current_global_qubits = (h->globalNumQubits > 0) ? h->globalNumQubits : numQubits_param;
+     if (targetQubit >= current_global_qubits && !(current_global_qubits == 0 && targetQubit == 0)) {
+         return ROCQ_STATUS_INVALID_VALUE;
+    }
+
+    unsigned KERNEL_BLOCK_SIZE = 256; // Should match measurement_kernels.hip usage
+
+    real_t global_prob0_rt = 0.0;
+    real_t global_prob1_rt = 0.0;
+
+    if (h->numGpus == 1) {
+        hipSetDevice(h->deviceIds[0]);
+        hipStream_t current_stream = h->streams[0];
+        rocComplex* current_d_state_slice = h->d_local_state_slices[0];
+        unsigned num_qubits_in_slice = h->numLocalQubitsPerGpu; // Should be current_global_qubits
+        size_t slice_num_elements = h->localStateSizes[0];
+
+        if (d_state_legacy != nullptr && d_state_legacy != current_d_state_slice) return ROCQ_STATUS_INVALID_VALUE;
+        if (numQubits_param != current_global_qubits) return ROCQ_STATUS_INVALID_VALUE;
+
+
+        unsigned num_kernel_blocks = 0;
+        if (slice_num_elements > 0) {
+            num_kernel_blocks = (slice_num_elements + KERNEL_BLOCK_SIZE -1) / KERNEL_BLOCK_SIZE;
+            if (num_kernel_blocks == 0) num_kernel_blocks = 1;
+        }
+
+        if (num_kernel_blocks > 0) {
+            real_t* d_block_probs = nullptr;
+            hipMalloc(&d_block_probs, num_kernel_blocks * 2 * sizeof(real_t));
+            hipMemsetAsync(d_block_probs, 0, num_kernel_blocks * 2 * sizeof(real_t), current_stream);
+            size_t shared_mem_size = KERNEL_BLOCK_SIZE * 2 * sizeof(real_t);
+
+            hipLaunchKernelGGL(calculate_local_slice_probabilities_kernel,
+                               dim3(num_kernel_blocks), dim3(KERNEL_BLOCK_SIZE), shared_mem_size, current_stream,
+                               current_d_state_slice, slice_num_elements,
+                               num_qubits_in_slice, targetQubit, // targetQubit is global here, but for single GPU, global=local
+                               d_block_probs);
+            if (hipGetLastError() != hipSuccess) { if(d_block_probs) hipFree(d_block_probs); return ROCQ_STATUS_HIP_ERROR; }
+
+            real_t* d_slice_probs_out = nullptr;
+            hipMalloc(&d_slice_probs_out, 2 * sizeof(real_t));
+            hipMemsetAsync(d_slice_probs_out, 0, 2 * sizeof(real_t), current_stream);
+
+            unsigned num_blocks_final_reduction = (num_kernel_blocks + KERNEL_BLOCK_SIZE - 1) / KERNEL_BLOCK_SIZE;
+            if(num_blocks_final_reduction == 0 && num_kernel_blocks > 0) num_blocks_final_reduction = 1;
+
+            if(num_blocks_final_reduction > 0) {
+                 hipLaunchKernelGGL(reduce_block_sums_to_slice_total_probs_kernel,
+                                dim3(num_blocks_final_reduction), dim3(KERNEL_BLOCK_SIZE), KERNEL_BLOCK_SIZE * 2 * sizeof(real_t), current_stream,
+                                d_block_probs, num_kernel_blocks, d_slice_probs_out);
+                 if (hipGetLastError() != hipSuccess) { hipFree(d_block_probs); hipFree(d_slice_probs_out); return ROCQ_STATUS_HIP_ERROR; }
+            }
+            real_t h_slice_probs_rt[2];
+            hipMemcpy(h_slice_probs_rt, d_slice_probs_out, 2 * sizeof(real_t), hipMemcpyDeviceToHost);
+            global_prob0_rt = h_slice_probs_rt[0];
+            global_prob1_rt = h_slice_probs_rt[1];
+            if(d_block_probs) hipFree(d_block_probs);
+            if(d_slice_probs_out) hipFree(d_slice_probs_out);
+        } else if (num_qubits_in_slice == 0 && targetQubit == 0 && slice_num_elements == 1) { // 0-qubit case
+            rocComplex h_amp;
+            hipMemcpy(&h_amp, current_d_state_slice, sizeof(rocComplex), hipMemcpyDeviceToHost);
+            global_prob0_rt = (real_t)h_amp.x * h_amp.x + (real_t)h_amp.y * h_amp.y; // All in |0>
+            global_prob1_rt = 0.0;
+        }
+        hipStreamSynchronize(current_stream);
+    } else { // Multi-GPU Path
+        if (targetQubit >= h->numLocalQubitsPerGpu) { // Target is a slice-determining qubit
+            // This scenario is more complex as Z_k would not act independently on each slice in a simple way
+            // for expectation value. It would require permutations or specific kernels.
+            return ROCQ_STATUS_NOT_IMPLEMENTED; // For now, only support measuring local-domain qubits for <Zk>
+        }
+        unsigned local_target_qubit = targetQubit; // Target qubit is within local part of each slice
+        std::vector<real_t*> d_slice_probs_all_gpus(h->numGpus, nullptr);
+
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            if (h->localStateSizes[i] == 0) continue;
+
+            unsigned num_kernel_blocks_stage1 = (h->localStateSizes[i] + KERNEL_BLOCK_SIZE -1) / KERNEL_BLOCK_SIZE;
+            if (num_kernel_blocks_stage1 == 0 && h->localStateSizes[i] > 0) num_kernel_blocks_stage1 = 1;
+            if (num_kernel_blocks_stage1 == 0) continue;
+
+            real_t* d_block_partial_probs_gpu_i = nullptr;
+            hipMalloc(&d_block_partial_probs_gpu_i, num_kernel_blocks_stage1 * 2 * sizeof(real_t));
+            hipMemsetAsync(d_block_partial_probs_gpu_i, 0, num_kernel_blocks_stage1 * 2 * sizeof(real_t), h->streams[i]);
+            size_t shared_mem_size_stage1 = KERNEL_BLOCK_SIZE * 2 * sizeof(real_t);
+
+            hipLaunchKernelGGL(calculate_local_slice_probabilities_kernel,
+                               dim3(num_kernel_blocks_stage1), dim3(KERNEL_BLOCK_SIZE), shared_mem_size_stage1, h->streams[i],
+                               h->d_local_state_slices[i], h->localStateSizes[i],
+                               h->numLocalQubitsPerGpu, local_target_qubit,
+                               d_block_partial_probs_gpu_i);
+            if (hipGetLastError() != hipSuccess) { status = ROCQ_STATUS_HIP_ERROR; if(d_block_partial_probs_gpu_i) hipFree(d_block_partial_probs_gpu_i); goto mgpu_expvalz_cleanup; }
+
+            hipMalloc(&d_slice_probs_all_gpus[i], 2 * sizeof(real_t));
+            hipMemsetAsync(d_slice_probs_all_gpus[i], 0, 2 * sizeof(real_t), h->streams[i]);
+
+            unsigned num_kernel_blocks_stage2 = (num_kernel_blocks_stage1 + KERNEL_BLOCK_SIZE - 1) / KERNEL_BLOCK_SIZE;
+            if(num_kernel_blocks_stage2 == 0 && num_kernel_blocks_stage1 > 0) num_kernel_blocks_stage2 = 1;
+
+            if (num_kernel_blocks_stage2 > 0) {
+                hipLaunchKernelGGL(reduce_block_sums_to_slice_total_probs_kernel,
+                                   dim3(num_kernel_blocks_stage2), dim3(KERNEL_BLOCK_SIZE), KERNEL_BLOCK_SIZE * 2 * sizeof(real_t), h->streams[i],
+                                   d_block_partial_probs_gpu_i, num_kernel_blocks_stage1, d_slice_probs_all_gpus[i]);
+                if (hipGetLastError() != hipSuccess) { status = ROCQ_STATUS_HIP_ERROR; if(d_block_partial_probs_gpu_i) hipFree(d_block_partial_probs_gpu_i); goto mgpu_expvalz_cleanup; }
+            }
+            if(d_block_partial_probs_gpu_i) hipFree(d_block_partial_probs_gpu_i);
+        }
+        if(status != ROCQ_STATUS_SUCCESS) goto mgpu_expvalz_cleanup;
+
+        for (int i = 0; i < h->numGpus; ++i) { // Sync before AllReduce
+            hipSetDevice(h->deviceIds[i]);
+            if (h->localStateSizes[i] == 0 || d_slice_probs_all_gpus[i] == nullptr) continue;
+            hipStreamSynchronize(h->streams[i]);
+        }
+
+        rcclDataType_t rccl_type = (sizeof(real_t) == sizeof(float)) ? rcclFloat : rcclDouble;
+        rcclGroupStart();
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            if (h->localStateSizes[i] == 0 || d_slice_probs_all_gpus[i] == nullptr) continue;
+            rcclAllReduce(d_slice_probs_all_gpus[i], d_slice_probs_all_gpus[i], 2, rccl_type, rcclSum, h->comms[i], h->streams[i]);
+        }
+        rcclGroupEnd();
+
+        for (int i = 0; i < h->numGpus; ++i) { // Sync AllReduce
+            hipSetDevice(h->deviceIds[i]);
+            if (h->localStateSizes[i] == 0 || d_slice_probs_all_gpus[i] == nullptr) continue;
+            if(hipStreamSynchronize(h->streams[i]) != hipSuccess && status == ROCQ_STATUS_SUCCESS) status = ROCQ_STATUS_HIP_ERROR;
+        }
+        if(status != ROCQ_STATUS_SUCCESS) goto mgpu_expvalz_cleanup;
+
+        real_t h_global_probs_rt[2] = {0.0, 0.0};
+        int first_participating_gpu = -1;
+        for(int i=0; i < h->numGpus; ++i) {
+            if (d_slice_probs_all_gpus[i] != nullptr) {
+                first_participating_gpu = i;
+                break;
+            }
+        }
+        if (first_participating_gpu != -1) {
+            hipSetDevice(h->deviceIds[first_participating_gpu]);
+            hipMemcpy(&h_global_probs_rt[0], d_slice_probs_all_gpus[first_participating_gpu], 2 * sizeof(real_t), hipMemcpyDeviceToHost);
+            global_prob0_rt = h_global_probs_rt[0];
+            global_prob1_rt = h_global_probs_rt[1];
+        }
+    mgpu_expvalz_cleanup:
+        for(int i=0; i<h->numGpus; ++i) if(d_slice_probs_all_gpus[i]) { hipSetDevice(h->deviceIds[i]); hipFree(d_slice_probs_all_gpus[i]); d_slice_probs_all_gpus[i] = nullptr;}
+        if(status != ROCQ_STATUS_SUCCESS) return status;
+    }
+
+    // <Zk> = P(k=0) - P(k=1)
+    // Normalize probabilities if they don't sum to 1 (can happen due to fp errors)
+    double total_prob = static_cast<double>(global_prob0_rt + global_prob1_rt);
+    if (fabs(total_prob) < REAL_EPSILON * 100) { // Avoid division by zero if state is zero vector
+        *h_result = 0.0;
+    } else {
+        if (fabs(total_prob - 1.0) > REAL_EPSILON * 100) { // If not normalized
+            global_prob0_rt /= total_prob;
+            global_prob1_rt /= total_prob;
+        }
+        *h_result = static_cast<double>(global_prob0_rt - global_prob1_rt);
+    }
+    return ROCQ_STATUS_SUCCESS;
+}
+
+
 rocqStatus_t rocsvApplyX(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit) {
     if (!handle) return ROCQ_STATUS_INVALID_VALUE;
     rocsvInternalHandle* h = static_cast<rocsvInternalHandle*>(handle);
@@ -867,7 +1057,7 @@ rocqStatus_t rocsvApplyX(rocsvHandle_t handle, rocComplex* d_state, unsigned num
         unsigned num_blocks = (num_thread_groups + threads_per_block - 1) / threads_per_block;
         if (num_thread_groups > 0 && num_blocks == 0) num_blocks = 1;
         else if (num_thread_groups == 0) {
-             if (local_num_qubits_for_kernel == 0 && targetQubitLocal == 0 && local_slice_num_elements == 1) num_blocks = 0;
+             if (local_num_qubits_for_kernel == 0 && targetQubitLocal == 0 && local_slice_num_elements == 1) num_blocks = 0; // Rx for 0 qubit state is identity effectively
              else if (local_num_qubits_for_kernel == 1 && local_slice_num_elements == 2) num_blocks = 1;
              else num_blocks = 0;
         }
@@ -1107,7 +1297,7 @@ rocqStatus_t rocsvApplyRx(rocsvHandle_t handle, rocComplex* d_state, unsigned nu
             if (h->localStateSizes[rank] != local_slice_num_elements && h->numGpus > 1 && h->globalNumQubits > 0) {status = ROCQ_STATUS_INVALID_VALUE; break;}
             if (num_blocks > 0 && h->localStateSizes[rank] > 0) {
                  hipLaunchKernelGGL(apply_Rx_kernel, dim3(num_blocks), dim3(threads_per_block), 0, h->streams[rank],
-                                   h->d_local_state_slices[rank], local_num_qubits_for_kernel, targetQubitLocal, static_cast<float>(theta));
+                                   h->d_local_state_slices[rank], local_num_qubits_for_kernel, targetQubitLocal, static_cast<real_t>(theta));
                 hipError_t hip_err_kernel = hipGetLastError();
                 if (hip_err_kernel != hipSuccess) { status = checkHipError(hip_err_kernel, "rocsvApplyRx apply_Rx_kernel"); break; }
             }
@@ -1146,7 +1336,7 @@ rocqStatus_t rocsvApplyRy(rocsvHandle_t handle, rocComplex* d_state, unsigned nu
             if (h->d_local_state_slices[rank] == nullptr && h->localStateSizes[rank] > 0) { status = ROCQ_STATUS_INVALID_VALUE; break; }
             if (h->localStateSizes[rank] != local_slice_num_elements && h->numGpus > 1 && h->globalNumQubits > 0) {status = ROCQ_STATUS_INVALID_VALUE; break;}
             if(num_blocks > 0 && h->localStateSizes[rank] > 0) {
-                hipLaunchKernelGGL(apply_Ry_kernel,dim3(num_blocks),dim3(threads_per_block),0,h->streams[rank],h->d_local_state_slices[rank],local_num_qubits_for_kernel,targetQubitLocal,static_cast<float>(theta));
+                hipLaunchKernelGGL(apply_Ry_kernel,dim3(num_blocks),dim3(threads_per_block),0,h->streams[rank],h->d_local_state_slices[rank],local_num_qubits_for_kernel,targetQubitLocal,static_cast<real_t>(theta));
                 if(hipGetLastError()!=hipSuccess){status = ROCQ_STATUS_HIP_ERROR; break;}
             }
             if(hipStreamSynchronize(h->streams[rank])!=hipSuccess){status = ROCQ_STATUS_HIP_ERROR; break;}
@@ -1168,22 +1358,26 @@ rocqStatus_t rocsvApplyRz(rocsvHandle_t handle, rocComplex* d_state, unsigned nu
         unsigned targetQubitLocal = targetQubit;
         rocqStatus_t status = ROCQ_STATUS_SUCCESS;
         unsigned threads_per_block = 256;
-        size_t num_thread_groups = (local_slice_num_elements > 0) ? local_slice_num_elements / 2 : 0;
-        unsigned num_blocks = (num_thread_groups + threads_per_block - 1) / threads_per_block;
-        if (num_thread_groups > 0 && num_blocks == 0) num_blocks = 1;
-        else if (num_thread_groups == 0) {
-             if (local_num_qubits_for_kernel == 0 && targetQubitLocal == 0 && local_slice_num_elements == 1) num_blocks = 1;
-             else if (local_num_qubits_for_kernel == 1 && local_slice_num_elements == 2) num_blocks = 1;
-             else num_blocks = 0;
-        }
+        // Rz affects all amplitudes if targetQubit is valid, even for 0-qubit state vector (size 1)
+        // if targetQubit is 0.
+        // For Rz, each thread can process one amplitude if num_qubits > 0, or one element if num_qubits = 0.
+        // The original code used num_thread_groups = N/2. For Rz, it's N elements, so N threads.
+        size_t num_kernel_elements = local_slice_num_elements;
+        unsigned num_blocks = (num_kernel_elements + threads_per_block - 1) / threads_per_block;
+
+        if (num_kernel_elements > 0 && num_blocks == 0) num_blocks = 1;
+        else if (num_kernel_elements == 0) num_blocks = 0;
+
         if (local_slice_num_elements == 0 && current_global_qubits > 0 && h->numGpus > 0) num_blocks = 0;
+
+
         for(int rank=0; rank < h->numGpus; ++rank) {
             hipError_t hip_err_set = hipSetDevice(h->deviceIds[rank]);
             if (hip_err_set != hipSuccess) { status = checkHipError(hip_err_set, "rocsvApplyRz hipSetDevice"); break; }
             if (h->d_local_state_slices[rank] == nullptr && h->localStateSizes[rank] > 0) { status = ROCQ_STATUS_INVALID_VALUE; break; }
             if (h->localStateSizes[rank] != local_slice_num_elements && h->numGpus > 1 && h->globalNumQubits > 0) {status = ROCQ_STATUS_INVALID_VALUE; break;}
             if(num_blocks > 0 && h->localStateSizes[rank] > 0) {
-                hipLaunchKernelGGL(apply_Rz_kernel,dim3(num_blocks),dim3(threads_per_block),0,h->streams[rank],h->d_local_state_slices[rank],local_num_qubits_for_kernel,targetQubitLocal,static_cast<float>(theta));
+                hipLaunchKernelGGL(apply_Rz_kernel,dim3(num_blocks),dim3(threads_per_block),0,h->streams[rank],h->d_local_state_slices[rank],local_num_qubits_for_kernel,targetQubitLocal,static_cast<real_t>(theta));
                 if(hipGetLastError()!=hipSuccess){status = ROCQ_STATUS_HIP_ERROR; break;}
             }
             if(hipStreamSynchronize(h->streams[rank])!=hipSuccess){status = ROCQ_STATUS_HIP_ERROR; break;}

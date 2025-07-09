@@ -274,6 +274,22 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
         }, py::arg("handle"), py::arg("d_state"), py::arg("num_qubits"), py::arg("qubit_to_measure"),
            "Measures a single qubit. Returns (outcome, probability).");
 
+    m.def("get_expectation_value_z",
+        [](const RocsvHandleWrapper& handle_wrapper, DeviceBuffer& d_state_buffer, unsigned numQubits, unsigned targetQubit) {
+            double result = 0.0;
+            rocqStatus_t status = rocsvGetExpectationValueSinglePauliZ(
+                                               handle_wrapper.get(),
+                                               d_state_buffer.get_ptr<rocComplex>(),
+                                               numQubits,
+                                               targetQubit,
+                                               &result);
+            if (status != ROCQ_STATUS_SUCCESS) {
+                throw std::runtime_error("rocsvGetExpectationValueSinglePauliZ failed: " + std::to_string(status));
+            }
+            return result;
+        }, py::arg("handle"), py::arg("d_state"), py::arg("num_qubits"), py::arg("target_qubit"),
+           "Calculates <Z_k> for the target qubit.");
+
     // Add a helper to create a DeviceBuffer and copy a numpy array to it
     m.def("create_device_matrix_from_numpy",
         [](py::array_t<rocComplex, py::array::c_style | py::array::forcecast> np_array) {
