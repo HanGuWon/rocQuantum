@@ -230,10 +230,50 @@ private:
 
 
 public:
-    // Keep track of active tensors during contraction using their indices from a temporary list.
-    // Or, better, a list of rocTensor objects that shrinks.
-    // For simplicity in this step, we'll operate on copies and rebuild.
     std::vector<rocquantum::util::rocTensor> active_tensors_during_contraction_;
+
+private:
+    rocquantum::util::WorkspaceManager* workspace_ = nullptr;
+    bool owns_workspace_ = false;
+
+    // Default workspace size if none provided (e.g., 256 MB)
+    static const size_t DEFAULT_WORKSPACE_SIZE_BYTES = 256 * 1024 * 1024;
+
+public:
+    // Constructor that takes an external workspace manager (optional)
+    TensorNetwork(rocquantum::util::WorkspaceManager* external_workspace = nullptr, hipStream_t stream = 0) {
+        if (external_workspace) {
+            workspace_ = external_workspace;
+            owns_workspace_ = false;
+        } else {
+            try {
+                workspace_ = new rocquantum::util::WorkspaceManager(DEFAULT_WORKSPACE_SIZE_BYTES, stream);
+                owns_workspace_ = true;
+            } catch (const std::runtime_error& e) {
+                // Failed to create default workspace, set to null and proceed without one,
+                // or rethrow / handle error appropriately. For now, proceed without.
+                workspace_ = nullptr;
+                owns_workspace_ = false;
+                // Consider logging this failure.
+            }
+        }
+    }
+
+    ~TensorNetwork() {
+        if (owns_workspace_ && workspace_) {
+            delete workspace_;
+            workspace_ = nullptr;
+        }
+        // Ensure any tensors in active_tensors_during_contraction_ that might have been
+        // allocated with rocTensorAllocate (not workspace) and are owned, are freed.
+        // However, the design is moving towards intermediates being workspace managed.
+        // Initial tensors are views. If contract() fails mid-way, it should clean up its intermediates.
+        for(auto& t : active_tensors_during_contraction_) {
+            if (t.owned_ && t.data_) { // If any tensor was somehow still marked owned and not from workspace
+                 rocquantum::util::rocTensorFree(&t); // (rocTensorFree checks ownership again)
+            }
+        }
+    }
 
 
 };
