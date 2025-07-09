@@ -3,10 +3,16 @@
 
 #include <hip/hip_runtime.h> // For hipFloatComplex, hipDoubleComplex, hipError_t
 
-// Define rocComplex based on precision (default to float for now)
-// TODO: Add a mechanism to switch precision (e.g., via a compile-time flag)
-typedef hipFloatComplex rocComplex;
-// typedef hipDoubleComplex rocComplex; // For double precision
+// Define rocComplex based on precision
+#ifdef ROCQ_PRECISION_DOUBLE
+    typedef hipDoubleComplex rocComplex;
+    typedef double real_t;
+    const real_t REAL_EPSILON = 1e-12;
+#else
+    typedef hipFloatComplex rocComplex;
+    typedef float real_t;
+    const real_t REAL_EPSILON = 1e-6f;
+#endif
 
 // Opaque handle for hipStateVec resources
 struct rocsvInternalHandle; // Forward declaration
@@ -198,19 +204,19 @@ rocqStatus_t rocsvApplyT(rocsvHandle_t handle, rocComplex* d_state, unsigned num
  * @brief Applies an Rx rotation gate to the target qubit.
  * @param theta Rotation angle in radians.
  */
-rocqStatus_t rocsvApplyRx(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit, double theta);
+rocqStatus_t rocsvApplyRx(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit, double theta); // theta stays double for API
 
 /**
  * @brief Applies an Ry rotation gate to the target qubit.
  * @param theta Rotation angle in radians.
  */
-rocqStatus_t rocsvApplyRy(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit, double theta);
+rocqStatus_t rocsvApplyRy(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit, double theta); // theta stays double for API
 
 /**
  * @brief Applies an Rz rotation gate to the target qubit.
  * @param theta Rotation angle in radians.
  */
-rocqStatus_t rocsvApplyRz(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit, double theta);
+rocqStatus_t rocsvApplyRz(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit, double theta); // theta stays double for API
 
 // --- Two Qubit Specific Gates ---
 
@@ -234,6 +240,25 @@ rocqStatus_t rocsvApplyCZ(rocsvHandle_t handle, rocComplex* d_state, unsigned nu
  * @param qubit2 Index of the second qubit.
  */
 rocqStatus_t rocsvApplySWAP(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned qubit1, unsigned qubit2);
+
+/**
+ * @brief Calculates the expectation value of a single Pauli Z operator on a target qubit.
+ * <psi|Z_k|psi> = P(k=0) - P(k=1)
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @param[in] d_state Pointer to the device state vector. For multi-GPU, this is legacy and the
+ *                    state from the handle's distributed slices is used. For single GPU, this must match
+ *                    the allocated state in the handle.
+ * @param[in] numQubits Total number of qubits in the state vector.
+ * @param[in] targetQubit The global index of the qubit for which to calculate <Z>.
+ * @param[out] result Pointer to store the expectation value (a double).
+ * @return rocqStatus_t Status of the operation.
+ */
+rocqStatus_t rocsvGetExpectationValueSinglePauliZ(rocsvHandle_t handle,
+                                                  rocComplex* d_state,
+                                                  unsigned numQubits,
+                                                  unsigned targetQubit,
+                                                  double* result);
 
 #ifdef __cplusplus
 } // extern "C"

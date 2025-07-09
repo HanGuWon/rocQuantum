@@ -12,18 +12,18 @@
 __global__ void calculate_prob0_kernel(const rocComplex* state,
                                        unsigned numQubits, // Total qubits in this state vector (slice)
                                        unsigned targetQubit, // Local index of target qubit in this slice
-                                       double* d_prob0_sum) { // Device pointer for sum
+                                       real_t* d_prob0_sum) { // Device pointer for sum (use real_t)
     size_t N = 1ULL << numQubits;
     // size_t k = 1ULL << targetQubit; // Stride related to targetQubit
 
     // HACK: Only one thread does the sum for now to avoid race for this placeholder
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        double p0 = 0.0;
+        real_t p0 = 0.0;
         if (N > 0) { // Ensure state is not empty (e.g. 0 local qubits for this slice)
             for (size_t i = 0; i < N; ++i) {
                 // Check if the targetQubit bit is 0 for state i
                 if (((i >> targetQubit) & 1) == 0) {
-                    p0 += (double)state[i].x * state[i].x + (double)state[i].y * state[i].y;
+                    p0 += (real_t)state[i].x * state[i].x + (real_t)state[i].y * state[i].y;
                 }
             }
         }
@@ -44,9 +44,17 @@ __global__ void collapse_state_kernel(rocComplex* state,
     if (tid < N) { // Check bounds for the current slice
         bool targetQubitIsOne = ((tid >> targetQubit) & 1);
         if (measuredOutcome == 0 && targetQubitIsOne) { // Measured 0, so zero out states where qubit is 1
-            state[tid] = make_hipFloatComplex(0.0f, 0.0f);
+#ifdef ROCQ_PRECISION_DOUBLE
+            state[tid] = {0.0, 0.0};
+#else
+            state[tid] = {0.0f, 0.0f};
+#endif
         } else if (measuredOutcome == 1 && !targetQubitIsOne) { // Measured 1, so zero out states where qubit is 0
-            state[tid] = make_hipFloatComplex(0.0f, 0.0f);
+#ifdef ROCQ_PRECISION_DOUBLE
+            state[tid] = {0.0, 0.0};
+#else
+            state[tid] = {0.0f, 0.0f};
+#endif
         }
         // Else, the amplitude remains (it's part of the collapsed state)
     }
@@ -58,7 +66,7 @@ __global__ void collapse_state_kernel(rocComplex* state,
 // amp_i_new = amp_i_old * norm_factor
 __global__ void renormalize_state_kernel(rocComplex* state,
                                          unsigned numQubits, // Total qubits in this state vector (slice)
-                                         double d_sum_sq_mag_inv_sqrt) { // Pass 1.0/sqrt(sum_sq_mag)
+                                         real_t d_sum_sq_mag_inv_sqrt) { // Pass 1.0/sqrt(sum_sq_mag) (use real_t)
     size_t N = 1ULL << numQubits;
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -72,14 +80,14 @@ __global__ void renormalize_state_kernel(rocComplex* state,
 // THIS IS A PLACEHOLDER KERNEL LOGIC (SINGLE GPU CONTEXT)
 __global__ void sum_sq_magnitudes_kernel(const rocComplex* state,
                                          unsigned numQubits, // Total qubits in this state vector (slice)
-                                         double* d_sum_sq_mag) {
+                                         real_t* d_sum_sq_mag) { // Use real_t
     size_t N = 1ULL << numQubits;
     // HACK: Single thread calculation for now
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        double current_sum_sq_mag = 0.0;
+        real_t current_sum_sq_mag = 0.0;
         if (N > 0) {
             for (size_t i = 0; i < N; ++i) {
-                current_sum_sq_mag += (double)state[i].x * state[i].x + (double)state[i].y * state[i].y;
+                current_sum_sq_mag += (real_t)state[i].x * state[i].x + (real_t)state[i].y * state[i].y;
             }
         }
         *d_sum_sq_mag = current_sum_sq_mag;
@@ -90,29 +98,29 @@ __global__ void sum_sq_magnitudes_kernel(const rocComplex* state,
 // --- New Kernels for Multi-GPU Measurement ---
 
 // Performs a block-level reduction to calculate sum of probabilities for |0> and |1> states of a target qubit.
-// Output d_block_partial_probs must be pre-allocated to hold 2 * gridDim.x doubles.
+// Output d_block_partial_probs must be pre-allocated to hold 2 * gridDim.x real_ts.
 // Each block writes its two sums (prob0_block, prob1_block) to its designated slot.
 __global__ void calculate_local_slice_probabilities_kernel(
     const rocComplex* local_slice_data,
     size_t local_slice_num_elements,    // Number of elements in this GPU's slice
     unsigned num_local_qubits,          // Number of qubits represented by local_slice_data
     unsigned local_target_qubit,        // Index of the qubit to measure (local to this slice)
-    double* d_block_partial_probs) {    // Output: array for [block0_p0, block0_p1, block1_p0, block1_p1, ...]
+    real_t* d_block_partial_probs) {    // Output: array for [block0_p0, block0_p1, block1_p0, block1_p1, ...] (use real_t)
 
-    extern __shared__ double sdata[]; // Shared memory for reduction, size: blockDim.x * 2 doubles
+    extern __shared__ real_t sdata[]; // Shared memory for reduction, size: blockDim.x * 2 real_ts
 
     unsigned int tid_in_block = threadIdx.x;
     size_t global_idx_start = blockIdx.x * blockDim.x;
 
-    double my_prob0 = 0.0;
-    double my_prob1 = 0.0;
+    real_t my_prob0 = 0.0;
+    real_t my_prob1 = 0.0;
 
     // Each thread processes multiple elements if necessary (grid-stride loop)
     for (size_t i = tid_in_block; i < blockDim.x; i += blockDim.x) { // This loop is over elements within a block's responsibility
         size_t current_local_idx = global_idx_start + i;
         if (current_local_idx < local_slice_num_elements) {
             rocComplex amp = local_slice_data[current_local_idx];
-            double mag_sq = (double)amp.x * amp.x + (double)amp.y * amp.y;
+            real_t mag_sq = (real_t)amp.x * amp.x + (real_t)amp.y * amp.y;
 
             if (((current_local_idx >> local_target_qubit) & 1) == 0) { // Qubit is |0>
                 my_prob0 += mag_sq;
@@ -150,25 +158,25 @@ __global__ void calculate_local_slice_probabilities_kernel(
 
 
 // Performs a block-level reduction for sum of squared magnitudes.
-// Output d_block_sum_sq_mag must be pre-allocated to hold gridDim.x doubles.
+// Output d_block_sum_sq_mag must be pre-allocated to hold gridDim.x real_ts.
 // Each block writes its sum to its designated slot.
 __global__ void calculate_local_slice_sum_sq_mag_kernel(
     const rocComplex* local_slice_data,
     size_t local_slice_num_elements,    // Number of elements in this GPU's slice
-    double* d_block_sum_sq_mag) {       // Output: array for [block0_sum, block1_sum, ...]
+    real_t* d_block_sum_sq_mag) {       // Output: array for [block0_sum, block1_sum, ...] (use real_t)
 
-    extern __shared__ double sdata_sum[]; // Shared memory for reduction, size: blockDim.x doubles
+    extern __shared__ real_t sdata_sum[]; // Shared memory for reduction, size: blockDim.x real_ts
 
     unsigned int tid_in_block = threadIdx.x;
     size_t global_idx_start = blockIdx.x * blockDim.x;
 
-    double my_sum_sq = 0.0;
+    real_t my_sum_sq = 0.0;
 
     for (size_t i = tid_in_block; i < blockDim.x; i += blockDim.x) {
         size_t current_local_idx = global_idx_start + i;
         if (current_local_idx < local_slice_num_elements) {
             rocComplex amp = local_slice_data[current_local_idx];
-            my_sum_sq += (double)amp.x * amp.x + (double)amp.y * amp.y;
+            my_sum_sq += (real_t)amp.x * amp.x + (real_t)amp.y * amp.y;
         }
     }
 
@@ -193,16 +201,16 @@ __global__ void calculate_local_slice_sum_sq_mag_kernel(
 // Assumes this kernel is launched with enough threads/blocks to efficiently sum d_block_partial_probs.
 // For simplicity, this can be a single block if num_blocks is not excessively large (e.g., < 1024*2).
 __global__ void reduce_block_sums_to_slice_total_probs_kernel(
-    const double* d_block_partial_probs, // Flattened array: [b0p0, b0p1, b1p0, b1p1, ...]
+    const real_t* d_block_partial_probs, // Flattened array: [b0p0, b0p1, b1p0, b1p1, ...] (use real_t)
     unsigned num_blocks_from_previous_kernel,
-    double* d_slice_total_probs_out) { // Output: [total_p0, total_p1]
+    real_t* d_slice_total_probs_out) { // Output: [total_p0, total_p1] (use real_t)
 
-    extern __shared__ double s_reduce_probs[]; // Shared memory, size: blockDim.x * 2 for p0 and p1 sums
+    extern __shared__ real_t s_reduce_probs[]; // Shared memory, size: blockDim.x * 2 for p0 and p1 sums
 
     unsigned int tid = threadIdx.x;
 
-    double my_p0_sum = 0.0;
-    double my_p1_sum = 0.0;
+    real_t my_p0_sum = 0.0;
+    real_t my_p1_sum = 0.0;
 
     // Each thread sums a portion of the d_block_partial_probs array
     // This loop structure assumes this kernel is launched with a single block,
@@ -243,13 +251,13 @@ __global__ void reduce_block_sums_to_slice_total_probs_kernel(
 // d_block_sum_sq_mag: input array of size num_blocks.
 // d_slice_total_sum_sq_mag_out: output array of size 1.
 __global__ void reduce_block_sums_to_slice_total_sum_sq_mag_kernel(
-    const double* d_block_sum_sq_mag_in, // Array of sums from each block of previous kernel
+    const real_t* d_block_sum_sq_mag_in, // Array of sums from each block of previous kernel (use real_t)
     unsigned num_blocks_from_previous_kernel,
-    double* d_slice_total_sum_sq_mag_out) { // Output: single double for the slice's total sum_sq_mag
+    real_t* d_slice_total_sum_sq_mag_out) { // Output: single real_t for the slice's total sum_sq_mag
 
-    extern __shared__ double s_reduce_sum_sq[]; // Shared memory, size: blockDim.x
+    extern __shared__ real_t s_reduce_sum_sq[]; // Shared memory, size: blockDim.x
     unsigned int tid = threadIdx.x;
-    double my_sum = 0.0;
+    real_t my_sum = 0.0;
 
     for (unsigned i = tid; i < num_blocks_from_previous_kernel; i += blockDim.x) {
         my_sum += d_block_sum_sq_mag_in[i];
