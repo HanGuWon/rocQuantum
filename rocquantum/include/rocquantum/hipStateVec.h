@@ -201,6 +201,11 @@ rocqStatus_t rocsvApplyS(rocsvHandle_t handle, rocComplex* d_state, unsigned num
 rocqStatus_t rocsvApplyT(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit);
 
 /**
+ * @brief Applies an S-dagger (conjugate transpose of S) gate to the target qubit.
+ */
+rocqStatus_t rocsvApplySdg(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit);
+
+/**
  * @brief Applies an Rx rotation gate to the target qubit.
  * @param theta Rotation angle in radians.
  */
@@ -259,6 +264,43 @@ rocqStatus_t rocsvGetExpectationValueSinglePauliZ(rocsvHandle_t handle,
                                                   unsigned numQubits,
                                                   unsigned targetQubit,
                                                   double* result);
+
+/**
+ * @brief Calculates the expectation value of a single Pauli X operator on a target qubit.
+ * <psi|X_k|psi>
+ * Note: This function MODIFIES the state vector by applying basis change rotations.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @param[in] d_state Pointer to the device state vector. (See notes in rocsvGetExpectationValueSinglePauliZ)
+ * @param[in] numQubits Total number of qubits.
+ * @param[in] targetQubit The global index of the qubit for <X>.
+ * @param[out] result Pointer to store the expectation value.
+ * @return rocqStatus_t Status.
+ */
+rocqStatus_t rocsvGetExpectationValueSinglePauliX(rocsvHandle_t handle,
+                                                  rocComplex* d_state,
+                                                  unsigned numQubits,
+                                                  unsigned targetQubit,
+                                                  double* result);
+
+/**
+ * @brief Calculates the expectation value of a single Pauli Y operator on a target qubit.
+ * <psi|Y_k|psi>
+ * Note: This function MODIFIES the state vector by applying basis change rotations.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @param[in] d_state Pointer to the device state vector. (See notes in rocsvGetExpectationValueSinglePauliZ)
+ * @param[in] numQubits Total number of qubits.
+ * @param[in] targetQubit The global index of the qubit for <Y>.
+ * @param[out] result Pointer to store the expectation value.
+ * @return rocqStatus_t Status.
+ */
+rocqStatus_t rocsvGetExpectationValueSinglePauliY(rocsvHandle_t handle,
+                                                  rocComplex* d_state,
+                                                  unsigned numQubits,
+                                                  unsigned targetQubit,
+                                                  double* result);
+
 
 #ifdef __cplusplus
 } // extern "C"

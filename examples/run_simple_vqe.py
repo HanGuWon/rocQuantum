@@ -24,11 +24,10 @@ def vqe_ansatz_simple(circuit: rocq.Circuit, theta: float, phi: float):
 
 
 # 2. Define the Hamiltonian
-# For v0.1, get_expval supports terms like {"Z0": coeff0, "Z1": coeff1}
-# H = 1.0 * Z0 + 0.5 * Z1
-hamiltonian = rocq.PauliOperator({"Z0": 1.0, "Z1": 0.5})
-# Or for a single Z0 term:
-# hamiltonian = rocq.PauliOperator("Z0")
+# H = 0.5*X0 + 0.75*Z1
+hamiltonian = rocq.PauliOperator({"X0": 0.5, "Z1": 0.75})
+# Example of a more complex Hamiltonian (though products are not yet supported by get_expval):
+# hamiltonian = rocq.PauliOperator({"X0 Z1": 0.5, "Z0 X1": 0.5, "Y0 Y1": -0.2})
 
 # 3. Define the number of qubits
 NUM_QUBITS = 2

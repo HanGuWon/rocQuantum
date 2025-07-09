@@ -217,6 +217,35 @@ __global__ void apply_S_kernel(rocComplex* state, unsigned numQubits, unsigned t
     }
 }
 
+// S Dagger Gate
+__global__ void apply_Sdg_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit) {
+    // Sdg = [[1, 0], [0, -i]]
+    // amp0_new = amp0_old
+    // amp1_new = -i * amp1_old = {amp1_old.y, -amp1_old.x}
+    size_t N = 1ULL << numQubits;
+    size_t k = 1ULL << targetQubit;
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    size_t outer_loop_factor = 1ULL << (targetQubit + 1);
+    size_t inner_loop_factor = k;
+    size_t group_idx = tid / inner_loop_factor;
+    size_t in_group_idx = tid % inner_loop_factor;
+    size_t idx0 = group_idx * outer_loop_factor + in_group_idx;
+    size_t idx1 = idx0 + inner_loop_factor;
+
+    if (idx1 < N) {
+        rocComplex amp1_old = state[idx1];
+#ifdef ROCQ_PRECISION_DOUBLE
+        state[idx1].x = amp1_old.y;
+        state[idx1].y = -amp1_old.x;
+#else
+        state[idx1].x = amp1_old.y;
+        state[idx1].y = -amp1_old.x;
+#endif
+    }
+}
+
+
 // T Gate
 __global__ void apply_T_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit) {
     // T = [[1, 0], [0, exp(i*pi/4)]]
