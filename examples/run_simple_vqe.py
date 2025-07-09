@@ -24,13 +24,16 @@ def vqe_ansatz_simple(circuit: rocq.Circuit, theta: float, phi: float):
 
 
 # 2. Define the Hamiltonian
-# H = 0.5*X0 + 0.75*Z1
-hamiltonian = rocq.PauliOperator({"X0": 0.5, "Z1": 0.75})
-# Example of a more complex Hamiltonian (though products are not yet supported by get_expval):
-# hamiltonian = rocq.PauliOperator({"X0 Z1": 0.5, "Z0 X1": 0.5, "Y0 Y1": -0.2})
+# H = 0.5*X0 + 0.75*Z1 - 0.25*Z0Z1 (Illustrative, Z0Z1 part will work now)
+# For full X0 Z1 etc. that would require more work on get_expval for mixed products.
+hamiltonian = rocq.PauliOperator({"X0": 0.5, "Z1": 0.75, "Z0 Z1": -0.25})
+
 
 # 3. Define the number of qubits
 NUM_QUBITS = 2
+# For a 1-qubit VQE with H = X0 + Z0
+# NUM_QUBITS = 1
+# hamiltonian = rocq.PauliOperator({"X0": 1.0, "Z0": 1.0})
 
 # Create a global simulator instance to avoid re-creation in objective_function
 # This is important as rocsvCreate/Destroy can be relatively expensive.
@@ -53,13 +56,12 @@ def objective_function(params):
     print(f"  VQE Iteration: theta={theta:.4f}, phi={phi:.4f}", end="")
 
     try:
-        # Build the circuit with current parameters
-        # The circuit is rebuilt in each call for this simple VQE.
-        # A more advanced version would update parameters in an existing program/circuit representation.
-        circuit = rocq.build(vqe_ansatz_simple, NUM_QUBITS, global_simulator, theta, phi)
+        # Update parameters in the existing program object
+        # This will re-apply the Python kernel logic to program.circuit_ref
+        current_program.update_params(theta, phi)
 
         # Calculate expectation value
-        energy = rocq.get_expval(circuit, hamiltonian)
+        energy = rocq.get_expval(current_program, hamiltonian)
         print(f" -> Energy: {energy:.6f}")
         return energy
     except Exception as e:
@@ -67,8 +69,11 @@ def objective_function(params):
         # Return a high value to steer optimizer away from problematic parameters
         return 1e6
 
+# Global program object for VQE
+current_program = None
 
 def run_vqe():
+    global current_program
     print("Starting Simple VQE Example...")
     print(f"Target Hamiltonian: {hamiltonian}")
     print(f"Number of Qubits: {NUM_QUBITS}")
@@ -76,8 +81,18 @@ def run_vqe():
     # Initial parameters for the ansatz
     # For vqe_ansatz_simple with Rx(theta) and Rz(phi)
     initial_params = np.array([0.5, 0.25]) # theta, phi
-
     print(f"Initial parameters: {initial_params}")
+
+    # Build the program once with initial parameters
+    # This also executes the circuit via program.circuit_ref for v0.1
+    try:
+        current_program = rocq.build(vqe_ansatz_simple, NUM_QUBITS, global_simulator, *initial_params)
+        print("\nInitial program built and conceptual MLIR generated (see above).")
+        # current_program.dump() # Optionally dump the MLIR module from C++ side
+    except Exception as e:
+        print(f"Failed to build initial program: {e}")
+        return
+
 
     # Use SciPy's minimize function
     # 'COBYLA' is a common choice for VQE as it doesn't require gradients.

@@ -324,6 +324,27 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
         }, py::arg("handle"), py::arg("d_state"), py::arg("num_qubits"), py::arg("target_qubit"),
            "Calculates <Y_k> for the target qubit. Modifies state vector.");
 
+    m.def("get_expectation_value_pauli_product_z",
+        [](const RocsvHandleWrapper& handle_wrapper, DeviceBuffer& d_state_buffer, unsigned numQubits,
+           const std::vector<unsigned>& targetQubits_vec) {
+            double result = 0.0;
+            if (targetQubits_vec.empty()) { // Should be handled by Python PauliOperator logic too
+                return 1.0; // Expectation of Identity
+            }
+            rocqStatus_t status = rocsvGetExpectationValuePauliProductZ(
+                                               handle_wrapper.get(),
+                                               d_state_buffer.get_ptr<rocComplex>(),
+                                               numQubits,
+                                               targetQubits_vec.data(), // Pass pointer to vector's data
+                                               static_cast<unsigned>(targetQubits_vec.size()),
+                                               &result);
+            if (status != ROCQ_STATUS_SUCCESS) {
+                throw std::runtime_error("rocsvGetExpectationValuePauliProductZ failed: " + std::to_string(status));
+            }
+            return result;
+        }, py::arg("handle"), py::arg("d_state"), py::arg("num_qubits"), py::arg("target_qubits"),
+           "Calculates <Z_q0 Z_q1 ...> for the target qubits. Does not modify state.");
+
     // Add a helper to create a DeviceBuffer and copy a numpy array to it
     m.def("create_device_matrix_from_numpy",
         [](py::array_t<rocComplex, py::array::c_style | py::array::forcecast> np_array) {
@@ -451,6 +472,10 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
         RocsvHandleWrapper& get_sim_handle() const { return sim_handle_ref_; }
     };
 
+// Forward declaration for MLIRCompiler bindings
+namespace rocquantum { namespace compiler { class MLIRCompiler; } }
+
+
     py::class_<RocTensorNetworkHandleWrapper>(m, "RocTensorNetwork")
         .def(py::init<RocsvHandleWrapper&>(), py::arg("simulator_handle"), "Creates a Tensor Network manager.")
         .def("add_tensor", [](RocTensorNetworkHandleWrapper& self, const rocquantum::util::rocTensor& tensor) {
@@ -493,5 +518,62 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
             }
             // result_tensor_py is modified in place by the C function if successful
         }, py::arg("result_tensor").noconvert(), "Contracts the tensor network. Result tensor must be pre-allocated.");
+
+    // --- MLIRCompiler Bindings ---
+    py::class_<rocquantum::compiler::MLIRCompiler>(m, "MLIRCompiler")
+        .def(py::init<>(), "Initializes the MLIR compiler environment.")
+        .def("initialize_module", &rocquantum::compiler::MLIRCompiler::initializeModule,
+             py::arg("module_name") = "rocq_module",
+             "Initializes a new MLIR module. Returns true on success.")
+        .def("dump_module", &rocquantum::compiler::MLIRCompiler::dumpModule,
+             "Dumps the current MLIR module to stderr.")
+        .def("get_module_string", &rocquantum::compiler::MLIRCompiler::getModuleString,
+             "Returns the current MLIR module as a string representation.")
+        .def("load_module_from_string", &rocquantum::compiler::MLIRCompiler::loadModuleFromString,
+             py::arg("mlir_string"),
+             "Parses an MLIR string and loads it into the compiler's module. Returns true on success.")
+        .def("create_function",
+             [](rocquantum::compiler::MLIRCompiler &self, const std::string& funcName,
+                const std::vector<std::string>& argTypeStrs,
+                const std::vector<std::string>& resultTypeStrs) {
+
+                mlir::MLIRContext* context = self.getContext();
+                if (!context) throw std::runtime_error("MLIRContext is null in MLIRCompiler.");
+
+                llvm::SmallVector<mlir::Type, 4> argTypes;
+                for (const auto& typeStr : argTypeStrs) {
+                    // For this to work robustly, types need to be registered or be builtin.
+                    // Our QuantumDialect registers "!quantum.qubit".
+                    // Other types like "f64", "i32" are builtin.
+                    mlir::Type type = mlir::parseAttribute(typeStr, context).dyn_cast_or_null<mlir::TypeAttr>().getValue();
+                    if (!type) { // Fallback for simple dialect types like "!quantum.qubit"
+                        if (typeStr == "!quantum.qubit") type = rocquantum::quantum::QubitType::get(context);
+                        // Add more custom type string parsing here if needed
+                    }
+                    if (!type) throw std::runtime_error("Failed to parse argument type string: " + typeStr);
+                    argTypes.push_back(type);
+                }
+
+                llvm::SmallVector<mlir::Type, 4> resultTypes;
+                for (const auto& typeStr : resultTypeStrs) {
+                    mlir::Type type = mlir::parseAttribute(typeStr, context).dyn_cast_or_null<mlir::TypeAttr>().getValue();
+                     if (!type) { // Fallback for simple dialect types
+                        if (typeStr == "!quantum.qubit") type = rocquantum::quantum::QubitType::get(context);
+                    }
+                    if (!type) throw std::runtime_error("Failed to parse result type string: " + typeStr);
+                    resultTypes.push_back(type);
+                }
+
+                // The C++ createFunction returns a FuncOp, but we don't bind FuncOp directly yet.
+                // We'll just call it and rely on it being added to the ModuleOp inside the compiler.
+                // Return true/false for success.
+                mlir::func::FuncOp funcOp = self.createFunction(funcName, argTypes, resultTypes);
+                return static_cast<bool>(funcOp); // True if funcOp is not null
+             },
+             py::arg("func_name"), py::arg("arg_type_strs"), py::arg("result_type_strs") = std::vector<std::string>(),
+             "Creates a new function (FuncOp) in the module. Types are specified as strings.");
+        // Note: getContext and getModule (returning raw pointers) are not exposed directly
+        // to Python for safety, unless a clear need and management strategy arises.
+        // Python will interact via higher-level methods that use these internally.
 
 }

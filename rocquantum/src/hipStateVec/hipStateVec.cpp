@@ -39,6 +39,10 @@ struct rocsvInternalHandle {
     // Temporary buffers for data redistribution (e.g., Alltoallv)
     std::vector<rocComplex*> d_swap_buffers;    // One swap buffer per GPU, same size as its local_state_slice
 
+    // Pinned host buffer for efficient H<->D transfers
+    void* h_pinned_buffer_ = nullptr;
+    size_t pinned_buffer_size_bytes_ = 0;
+
     // hiprandGenerator_t rand_generator; // For future rocRAND integration (would also need to be per-GPU or managed)
     // Adding legacy single-GPU stream and blas handle for functions not yet fully multi-GPU aware
     // These will typically point to the resources of device 0 if numGpus > 0
@@ -52,6 +56,68 @@ struct rocsvInternalHandle {
 rocqStatus_t checkHipError(hipError_t err, const char* operation = "") {
     if (err != hipSuccess) {
         return ROCQ_STATUS_HIP_ERROR;
+    }
+    return ROCQ_STATUS_SUCCESS;
+}
+
+// --- Pinned Memory Management ---
+
+rocqStatus_t rocsvEnsurePinnedBuffer(rocsvHandle_t handle, size_t minSizeBytes) {
+    if (!handle) return ROCQ_STATUS_INVALID_VALUE;
+    rocsvInternalHandle* h = static_cast<rocsvInternalHandle*>(handle);
+
+    if (h->h_pinned_buffer_ != nullptr && h->pinned_buffer_size_bytes_ >= minSizeBytes) {
+        // Buffer exists and is large enough
+        return ROCQ_STATUS_SUCCESS;
+    }
+
+    // If buffer exists but is too small, free it first
+    if (h->h_pinned_buffer_ != nullptr) {
+        hipError_t free_err = hipHostFree(h->h_pinned_buffer_);
+        h->h_pinned_buffer_ = nullptr;
+        h->pinned_buffer_size_bytes_ = 0;
+        if (free_err != hipSuccess) {
+            return checkHipError(free_err, "rocsvEnsurePinnedBuffer hipHostFree");
+        }
+    }
+
+    if (minSizeBytes == 0) { // Request to free or ensure 0 size.
+        return ROCQ_STATUS_SUCCESS;
+    }
+
+    // Allocate new pinned buffer
+    // Note: hipSetDevice might be relevant if NUMA configurations matter for pinned memory,
+    // but typically hipHostMalloc is system-wide. For now, assume device 0 context is fine.
+    hipError_t set_dev_err = hipSetDevice(h->deviceIds.empty() ? 0 : h->deviceIds[0]);
+     if (set_dev_err != hipSuccess) return checkHipError(set_dev_err, "rocsvEnsurePinnedBuffer hipSetDevice");
+
+    hipError_t alloc_err = hipHostMalloc(&(h->h_pinned_buffer_), minSizeBytes, hipHostMallocDefault);
+    if (alloc_err != hipSuccess) {
+        h->h_pinned_buffer_ = nullptr;
+        h->pinned_buffer_size_bytes_ = 0;
+        return checkHipError(alloc_err, "rocsvEnsurePinnedBuffer hipHostMalloc");
+    }
+    h->pinned_buffer_size_bytes_ = minSizeBytes;
+    return ROCQ_STATUS_SUCCESS;
+}
+
+void* rocsvGetPinnedBufferPointer(rocsvHandle_t handle) {
+    if (!handle) return nullptr;
+    rocsvInternalHandle* h = static_cast<rocsvInternalHandle*>(handle);
+    return h->h_pinned_buffer_;
+}
+
+rocqStatus_t rocsvFreePinnedBuffer(rocsvHandle_t handle) {
+    if (!handle) return ROCQ_STATUS_INVALID_VALUE;
+    rocsvInternalHandle* h = static_cast<rocsvInternalHandle*>(handle);
+
+    if (h->h_pinned_buffer_ != nullptr) {
+        hipError_t free_err = hipHostFree(h->h_pinned_buffer_);
+        h->h_pinned_buffer_ = nullptr;
+        h->pinned_buffer_size_bytes_ = 0;
+        if (free_err != hipSuccess) {
+            return checkHipError(free_err, "rocsvFreePinnedBuffer hipHostFree");
+        }
     }
     return ROCQ_STATUS_SUCCESS;
 }
@@ -125,14 +191,29 @@ __global__ void calculate_local_slice_sum_sq_mag_kernel(
     double* d_block_sum_sq_mag);
 
 __global__ void reduce_block_sums_to_slice_total_probs_kernel(
-    const double* d_block_partial_probs,
+    const real_t* d_block_partial_probs, // Updated to real_t
     unsigned num_blocks_from_previous_kernel,
-    double* d_slice_total_probs_out);
+    real_t* d_slice_total_probs_out);    // Updated to real_t
 
 __global__ void reduce_block_sums_to_slice_total_sum_sq_mag_kernel(
-    const double* d_block_sum_sq_mag_in,
+    const real_t* d_block_sum_sq_mag_in, // Updated to real_t
     unsigned num_blocks_from_previous_kernel,
-    double* d_slice_total_sum_sq_mag_out);
+    real_t* d_slice_total_sum_sq_mag_out); // Updated to real_t
+
+// New kernel forward declarations for Pauli Product Z
+__global__ void calculate_multi_z_probabilities_kernel(
+    const rocComplex* local_slice_data,
+    size_t local_slice_num_elements,
+    unsigned num_local_qubits,
+    const unsigned* d_target_qubits,
+    unsigned num_target_paulis,
+    real_t* d_outcome_probs_blocks);
+
+__global__ void reduce_multi_z_block_probs_to_slice_total_kernel(
+    const real_t* d_block_outcome_probs,
+    unsigned num_prev_blocks,
+    unsigned num_outcomes,
+    real_t* d_slice_total_outcome_probs);
 
 
 __global__ void apply_three_qubit_generic_matrix_kernel(rocComplex* state, unsigned numQubits, const unsigned* targetQubitIndices_gpu, const rocComplex* matrixDevice);
@@ -160,6 +241,8 @@ rocqStatus_t rocsvCreate(rocsvHandle_t* handle) {
     internal_handle->globalNumQubits = 0;
     internal_handle->numLocalQubitsPerGpu = 0;
     internal_handle->numGlobalSliceQubits = 0;
+    internal_handle->h_pinned_buffer_ = nullptr;
+    internal_handle->pinned_buffer_size_bytes_ = 0;
 
     hipError_t hip_err;
     rocblas_status blas_err;
@@ -221,6 +304,13 @@ rocqStatus_t rocsvDestroy(rocsvHandle_t handle) {
         internal_handle->d_local_state_slices[i] = nullptr;
         if (internal_handle->d_swap_buffers[i]) if (hipFree(internal_handle->d_swap_buffers[i]) != hipSuccess && first_error_status == ROCQ_STATUS_SUCCESS) first_error_status = ROCQ_STATUS_HIP_ERROR;
         internal_handle->d_swap_buffers[i] = nullptr;
+    }
+    if (internal_handle->h_pinned_buffer_) {
+        if (hipHostFree(internal_handle->h_pinned_buffer_) != hipSuccess && first_error_status == ROCQ_STATUS_SUCCESS) {
+            first_error_status = ROCQ_STATUS_HIP_ERROR;
+        }
+        internal_handle->h_pinned_buffer_ = nullptr;
+        internal_handle->pinned_buffer_size_bytes_ = 0;
     }
     internal_handle->deviceIds.clear(); internal_handle->streams.clear(); internal_handle->blasHandles.clear(); internal_handle->comms.clear();
     internal_handle->d_local_state_slices.clear(); internal_handle->localStateSizes.clear(); internal_handle->d_swap_buffers.clear();
@@ -637,7 +727,11 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
     }
 
     // --- Multi-GPU Path ---
+    // Note: Measuring a slice-determining qubit directly (i.e., qubitToMeasure >= h->numLocalQubitsPerGpu)
+    // is not implemented. Such a qubit must first be swapped into the local domain using rocsvSwapIndexBits.
     if (qubitToMeasure >= h->numLocalQubitsPerGpu && h->numGpus > 1) {
+        // Adding an explicit error message here for clarity, though MULTI_GPU_GUIDE.md covers it.
+        // fprintf(stderr, "Error: Measuring slice-determining qubit %u directly is not supported in multi-GPU mode.\n", qubitToMeasure);
         return ROCQ_STATUS_NOT_IMPLEMENTED;
     }
     unsigned local_target_qubit = qubitToMeasure;
@@ -940,6 +1034,10 @@ rocqStatus_t rocsvGetExpectationValueSinglePauliZ(rocsvHandle_t handle,
         }
         hipStreamSynchronize(current_stream);
     } else { // Multi-GPU Path
+        // Note: For multi-GPU, targetQubit for <Zk> must currently be a local-domain qubit
+        // (i.e., targetQubit < h->numLocalQubitsPerGpu).
+        // Calculating <Zk> for a slice-determining qubit directly is not implemented
+        // and would require rocsvSwapIndexBits to make it local first.
         if (targetQubit >= h->numLocalQubitsPerGpu) { // Target is a slice-determining qubit
             // This scenario is more complex as Z_k would not act independently on each slice in a simple way
             // for expectation value. It would require permutations or specific kernels.
@@ -1600,6 +1698,235 @@ rocqStatus_t rocsvGetExpectationValueSinglePauliY(rocsvHandle_t handle,
     // Apply S
     status = rocsvApplyS(handle, d_state, numQubits, targetQubit);
     return status;
+}
+
+rocqStatus_t rocsvGetExpectationValuePauliProductZ(rocsvHandle_t handle,
+                                                   rocComplex* d_state_legacy,
+                                                   unsigned numQubits_param,
+                                                   const unsigned* h_target_qubits, // Host array of target qubit indices
+                                                   unsigned num_target_paulis,
+                                                   double* h_result) {
+    if (!handle || !h_result || (!h_target_qubits && num_target_paulis > 0)) return ROCQ_STATUS_INVALID_VALUE;
+    rocsvInternalHandle* h = static_cast<rocsvInternalHandle*>(handle);
+    rocqStatus_t status = ROCQ_STATUS_SUCCESS;
+
+    if (h->numGpus == 0) return ROCQ_STATUS_FAILURE;
+    unsigned current_global_qubits = (h->globalNumQubits > 0) ? h->globalNumQubits : numQubits_param;
+
+    if (num_target_paulis == 0) { // Expectation of Identity operator
+        *h_result = 1.0;
+        return ROCQ_STATUS_SUCCESS;
+    }
+    if (num_target_paulis > 8) { // Current kernel limitation
+        return ROCQ_STATUS_NOT_IMPLEMENTED; // Or INVALID_VALUE if we decide max k for this API
+    }
+
+    for (unsigned i = 0; i < num_target_paulis; ++i) {
+        if (h_target_qubits[i] >= current_global_qubits) return ROCQ_STATUS_INVALID_VALUE;
+        // Check for duplicate target qubits in the product string (e.g., Z0 Z0 = I)
+        for (unsigned j = i + 1; j < num_target_paulis; ++j) {
+            if (h_target_qubits[i] == h_target_qubits[j]) return ROCQ_STATUS_INVALID_VALUE; // Or handle simplification
+        }
+    }
+
+    unsigned KERNEL_BLOCK_SIZE = 256; // Should be consistent with what kernels expect
+    unsigned num_outcomes = 1 << num_target_paulis; // 2^k outcomes
+
+    std::vector<real_t> h_global_outcome_probs_rt(num_outcomes, 0.0);
+    unsigned* d_target_qubits_gpu = nullptr; // Device copy of target qubit indices
+
+    // --- Prepare target qubit indices on device ---
+    // This needs to be done once, accessible by all GPUs if logic is per-GPU using global indices,
+    // or translated to local indices per GPU if kernels expect local indices.
+    // The calculate_multi_z_probabilities_kernel is designed to work on a local slice with local indices.
+    // This implies that for multi-GPU, all target qubits for ProductZ must currently be in the local domain.
+    // Operating on slice-determining qubits directly would require rocsvSwapIndexBits.
+
+    for(unsigned i=0; i<num_target_paulis; ++i) {
+        if (h_target_qubits[i] >= h->numLocalQubitsPerGpu && h->numGpus > 1) {
+            // If any target qubit is a slice-determining qubit in multi-GPU mode
+            return ROCQ_STATUS_NOT_IMPLEMENTED;
+        }
+    }
+    // If all target qubits are local-domain, their indices are the same for all slices.
+    // We can copy h_target_qubits to each GPU's constant/global memory or pass by value if small enough.
+    // For calculate_multi_z_probabilities_kernel, it takes d_target_qubits.
+    // So, we need to make this available on each GPU.
+
+    std::vector<real_t*> d_slice_outcome_probs_all_gpus(h->numGpus, nullptr);
+
+    for (int i = 0; i < h->numGpus; ++i) {
+        hipSetDevice(h->deviceIds[i]);
+        if (h->localStateSizes[i] == 0) continue;
+
+        // Copy target qubit indices to current GPU
+        // This is inefficient if num_target_paulis is large, but for small k, it's okay.
+        // A better way would be to copy to constant memory once per kernel launch if possible,
+        // or ensure d_target_qubits_gpu is allocated once and visible.
+        // For simplicity now, copy per GPU if needed by kernel.
+        // The kernel signature takes const unsigned* d_target_qubits.
+        if (hipMalloc(&d_target_qubits_gpu, num_target_paulis * sizeof(unsigned)) != hipSuccess) {
+            status = ROCQ_STATUS_ALLOCATION_FAILED; goto mgpu_prod_z_cleanup;
+        }
+        if (hipMemcpyAsync(d_target_qubits_gpu, h_target_qubits, num_target_paulis * sizeof(unsigned), hipMemcpyHostToDevice, h->streams[i]) != hipSuccess) {
+            status = ROCQ_STATUS_HIP_ERROR; goto mgpu_prod_z_cleanup;
+        }
+
+
+        unsigned num_kernel_blocks_stage1 = (h->localStateSizes[i] + KERNEL_BLOCK_SIZE -1) / KERNEL_BLOCK_SIZE;
+        if (num_kernel_blocks_stage1 == 0 && h->localStateSizes[i] > 0) num_kernel_blocks_stage1 = 1;
+        if (num_kernel_blocks_stage1 == 0) { if(d_target_qubits_gpu) hipFree(d_target_qubits_gpu); d_target_qubits_gpu = nullptr; continue; }
+
+
+        real_t* d_block_outcome_probs_gpu_i = nullptr;
+        if (hipMalloc(&d_block_outcome_probs_gpu_i, num_kernel_blocks_stage1 * num_outcomes * sizeof(real_t)) != hipSuccess) {
+            status = ROCQ_STATUS_ALLOCATION_FAILED; goto mgpu_prod_z_cleanup;
+        }
+        hipMemsetAsync(d_block_outcome_probs_gpu_i, 0, num_kernel_blocks_stage1 * num_outcomes * sizeof(real_t), h->streams[i]);
+
+        size_t shared_mem_size_stage1 = num_outcomes * sizeof(real_t); // For s_prob_bins in kernel
+        if (shared_mem_size_stage1 > 48*1024) { /* handle shared mem limit */ status = ROCQ_STATUS_INVALID_VALUE; goto mgpu_prod_z_cleanup; }
+
+
+        hipLaunchKernelGGL(calculate_multi_z_probabilities_kernel,
+                           dim3(num_kernel_blocks_stage1), dim3(KERNEL_BLOCK_SIZE), shared_mem_size_stage1, h->streams[i],
+                           h->d_local_state_slices[i], h->localStateSizes[i],
+                           h->numLocalQubitsPerGpu, d_target_qubits_gpu, num_target_paulis,
+                           d_block_outcome_probs_gpu_i);
+        if (hipGetLastError() != hipSuccess) { status = ROCQ_STATUS_HIP_ERROR; if(d_block_outcome_probs_gpu_i) hipFree(d_block_outcome_probs_gpu_i); goto mgpu_prod_z_cleanup; }
+
+        if (hipMalloc(&d_slice_outcome_probs_all_gpus[i], num_outcomes * sizeof(real_t)) != hipSuccess) {
+             status = ROCQ_STATUS_ALLOCATION_FAILED; if(d_block_outcome_probs_gpu_i) hipFree(d_block_outcome_probs_gpu_i); goto mgpu_prod_z_cleanup;
+        }
+        hipMemsetAsync(d_slice_outcome_probs_all_gpus[i], 0, num_outcomes * sizeof(real_t), h->streams[i]);
+
+        // The reduction kernel needs to be launched carefully.
+        // If num_outcomes is small enough (e.g. <= KERNEL_BLOCK_SIZE), launch 1 block with num_outcomes threads.
+        unsigned num_threads_stage2 = num_outcomes;
+        unsigned num_blocks_stage2 = 1;
+        if (num_outcomes > KERNEL_BLOCK_SIZE) { // Need multiple blocks for stage 2, or a more complex reduction
+            // This simple reduction kernel is not designed for num_outcomes > KERNEL_BLOCK_SIZE if multi-block.
+            // For now, restrict to what one block can handle or improve kernel.
+            // Let's assume num_outcomes <= KERNEL_BLOCK_SIZE for this reduction kernel launch.
+            return ROCQ_STATUS_NOT_IMPLEMENTED; // If num_outcomes too large for simple reduction kernel
+        }
+
+        if (num_kernel_blocks_stage1 > 0) { // Only run reduction if there were blocks in stage 1
+             hipLaunchKernelGGL(reduce_multi_z_block_probs_to_slice_total_kernel,
+                               dim3(num_blocks_stage2), dim3(num_threads_stage2), num_outcomes * sizeof(real_t), h->streams[i],
+                               d_block_outcome_probs_gpu_i, num_kernel_blocks_stage1, num_outcomes,
+                               d_slice_outcome_probs_all_gpus[i]);
+            if (hipGetLastError() != hipSuccess) { status = ROCQ_STATUS_HIP_ERROR; if(d_block_outcome_probs_gpu_i) hipFree(d_block_outcome_probs_gpu_i); goto mgpu_prod_z_cleanup; }
+        }
+        if(d_block_outcome_probs_gpu_i) hipFree(d_block_outcome_probs_gpu_i);
+        if(d_target_qubits_gpu) hipFree(d_target_qubits_gpu); // Free per-GPU copy
+        d_target_qubits_gpu = nullptr; // Avoid double free in loop
+    }
+    if(d_target_qubits_gpu) hipFree(d_target_qubits_gpu); // Should be null if loop ran
+    d_target_qubits_gpu = nullptr;
+
+    if(status != ROCQ_STATUS_SUCCESS) goto mgpu_prod_z_cleanup;
+
+    for (int i = 0; i < h->numGpus; ++i) { // Sync before AllReduce
+        hipSetDevice(h->deviceIds[i]);
+        if (h->localStateSizes[i] == 0 || d_slice_outcome_probs_all_gpus[i] == nullptr) continue;
+        hipStreamSynchronize(h->streams[i]);
+    }
+
+    rcclDataType_t rccl_type = (sizeof(real_t) == sizeof(float)) ? rcclFloat : rcclDouble;
+    if (h->numGpus > 1) {
+        rcclGroupStart();
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            if (h->localStateSizes[i] == 0 || d_slice_outcome_probs_all_gpus[i] == nullptr) continue;
+            // Each GPU has its full d_slice_outcome_probs_all_gpus[i] array of size num_outcomes.
+            // We need to sum these arrays element-wise across GPUs.
+            rcclAllReduce(d_slice_outcome_probs_all_gpus[i], d_slice_outcome_probs_all_gpus[i],
+                          num_outcomes, rccl_type, rcclSum, h->comms[i], h->streams[i]);
+        }
+        rcclGroupEnd();
+
+        for (int i = 0; i < h->numGpus; ++i) { // Sync AllReduce
+            hipSetDevice(h->deviceIds[i]);
+            if (h->localStateSizes[i] == 0 || d_slice_outcome_probs_all_gpus[i] == nullptr) continue;
+            if(hipStreamSynchronize(h->streams[i]) != hipSuccess && status == ROCQ_STATUS_SUCCESS) status = ROCQ_STATUS_HIP_ERROR;
+        }
+    }
+    if(status != ROCQ_STATUS_SUCCESS) goto mgpu_prod_z_cleanup;
+
+    // Copy result from first participating GPU
+    int first_participating_gpu = -1;
+    for(int i=0; i < h->numGpus; ++i) {
+        if (d_slice_outcome_probs_all_gpus[i] != nullptr) {
+            first_participating_gpu = i;
+            break;
+        }
+    }
+    if (first_participating_gpu != -1) {
+        hipSetDevice(h->deviceIds[first_participating_gpu]); // Ensure correct context for hipMemcpy
+        hipMemcpy(h_global_outcome_probs_rt.data(), d_slice_outcome_probs_all_gpus[first_participating_gpu],
+                  num_outcomes * sizeof(real_t), hipMemcpyDeviceToHost);
+    } else { // No GPU had data (e.g. 0 qubit simulation on multi-GPU setup which is invalid)
+         if (num_target_paulis > 0 ) { status = ROCQ_STATUS_FAILURE; goto mgpu_prod_z_cleanup; }
+         // If num_target_paulis == 0, result is 1.0 (handled at start)
+    }
+
+
+mgpu_prod_z_cleanup:
+    if(d_target_qubits_gpu) hipFree(d_target_qubits_gpu);
+    for(int i=0; i<h->numGpus; ++i) {
+        if(d_slice_outcome_probs_all_gpus[i]) {
+            // Ensure correct device context before freeing memory allocated on that device
+            // This might not be strictly necessary if hipSetDevice was the last call for this GPU,
+            // but good for safety if other ops interleave.
+            // However, in this loop, hipSetDevice is not called before free.
+            // Freeing should happen on the device that allocated it.
+            // The loop structure for allocation and this cleanup loop might need device switching.
+            // For simplicity, assume hipFree can manage if called from any context,
+            // or that the context is sticky from the last hipSetDevice(h->deviceIds[i])
+            // in the AllReduce sync loop. This can be fragile.
+            // Safer: hipSetDevice(h->deviceIds[i]); hipFree(d_slice_outcome_probs_all_gpus[i]);
+            hipFree(d_slice_outcome_probs_all_gpus[i]);
+            d_slice_outcome_probs_all_gpus[i] = nullptr;
+        }
+    }
+    if(status != ROCQ_STATUS_SUCCESS) return status;
+
+    // Calculate final expectation value: sum_s (-1)^(parity of s) * P(s)
+    // where s is the bitstring for (targetQubit_k-1, ..., targetQubit_0)
+    real_t final_exp_val_rt = 0.0;
+    for (unsigned i = 0; i < num_outcomes; ++i) {
+        unsigned parity = 0;
+        // Calculate parity of outcome index 'i'
+        // (number of set bits in the binary representation of i)
+        unsigned temp_i = i;
+        while(temp_i > 0) {
+            parity += (temp_i & 1);
+            temp_i >>= 1;
+        }
+
+        if (parity % 2 == 0) { // Even parity
+            final_exp_val_rt += h_global_outcome_probs_rt[i];
+        } else { // Odd parity
+            final_exp_val_rt -= h_global_outcome_probs_rt[i];
+        }
+    }
+
+    // Normalize if needed (should ideally sum to 1.0)
+    double total_prob_check = 0.0;
+    for(real_t p : h_global_outcome_probs_rt) total_prob_check += static_cast<double>(p);
+
+    if (fabs(total_prob_check) < REAL_EPSILON * 100) {
+        *h_result = 0.0; // If total probability is zero, expectation is zero
+    } else {
+        // Normalization of individual probabilities was implicitly handled by using them directly.
+        // The expectation value itself doesn't need renormalization if probabilities were correct.
+        // However, if sum P(s) != 1, then the expectation value might be off scale.
+        // For Pauli Z product, it's Sum (-1)^parity(s) P(s). If Sum P(s) is not 1, this is still the definition.
+         *h_result = static_cast<double>(final_exp_val_rt);
+    }
+
+    return ROCQ_STATUS_SUCCESS;
 }
 
 
