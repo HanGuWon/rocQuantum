@@ -246,6 +246,37 @@ rocqStatus_t rocsvApplyCZ(rocsvHandle_t handle, rocComplex* d_state, unsigned nu
  */
 rocqStatus_t rocsvApplySWAP(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned qubit1, unsigned qubit2);
 
+// --- Pinned Memory Management ---
+/**
+ * @brief Ensures a pinned host buffer of at least `minSizeBytes` is allocated within the handle.
+ * If a buffer exists but is smaller, it's reallocated. If it's already large enough, it's reused.
+ * The pointer to the pinned buffer can be retrieved using `rocsvGetPinnedBufferPointer`.
+ * This buffer is intended for efficient asynchronous host-to-device or device-to-host transfers.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @param[in] minSizeBytes The minimum required size of the pinned buffer in bytes.
+ * @return rocqStatus_t Status of the operation.
+ */
+rocqStatus_t rocsvEnsurePinnedBuffer(rocsvHandle_t handle, size_t minSizeBytes);
+
+/**
+ * @brief Retrieves a pointer to the internally managed pinned host buffer.
+ * Call `rocsvEnsurePinnedBuffer` first to make sure it's allocated to a sufficient size.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @return void* Pointer to the pinned host buffer, or nullptr if not allocated or handle is invalid.
+ */
+void* rocsvGetPinnedBufferPointer(rocsvHandle_t handle);
+
+/**
+ * @brief Frees the internally managed pinned host buffer.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @return rocqStatus_t Status of the operation.
+ */
+rocqStatus_t rocsvFreePinnedBuffer(rocsvHandle_t handle);
+
+
 /**
  * @brief Calculates the expectation value of a single Pauli Z operator on a target qubit.
  * <psi|Z_k|psi> = P(k=0) - P(k=1)
@@ -300,6 +331,26 @@ rocqStatus_t rocsvGetExpectationValueSinglePauliY(rocsvHandle_t handle,
                                                   unsigned numQubits,
                                                   unsigned targetQubit,
                                                   double* result);
+
+/**
+ * @brief Calculates the expectation value of a product of Pauli Z operators.
+ * <psi|Z_q0 Z_q1 ... Z_qn|psi>
+ * Note: This function does NOT modify the state vector.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @param[in] d_state Pointer to the device state vector. (See notes in rocsvGetExpectationValueSinglePauliZ)
+ * @param[in] numQubits Total number of qubits.
+ * @param[in] targetQubits Array of global qubit indices for the Z operators.
+ * @param[in] numTargetPaulis Number of Pauli Z operators in the product (length of targetQubits array).
+ * @param[out] result Pointer to store the expectation value.
+ * @return rocqStatus_t Status.
+ */
+rocqStatus_t rocsvGetExpectationValuePauliProductZ(rocsvHandle_t handle,
+                                                   rocComplex* d_state,
+                                                   unsigned numQubits,
+                                                   const unsigned* targetQubits,
+                                                   unsigned numTargetPaulis,
+                                                   double* result);
 
 
 #ifdef __cplusplus

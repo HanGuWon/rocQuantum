@@ -383,17 +383,71 @@ import inspect # To get source code for AST parsing
 
 class QuantumProgram:
     """
-    Represents a "compiled" quantum program, initially just storing
-    a string representation of conceptual MLIR.
+    Represents a "compiled" quantum program, holding an MLIR module
+    and providing methods to interact with it.
     """
-    def __init__(self, name: str, num_qubits: int, mlir_string: str):
+    def __init__(self, name: str, num_qubits: int, mlir_compiler: backend.MLIRCompiler,
+                 kernel_func=None, static_args=None, simulator_ref=None):
         self.name = name
         self.num_qubits = num_qubits
-        self.mlir_string = mlir_string
-        self.circuit_ref = None # Will hold the executable Circuit for v0.1
+        self.mlir_compiler = mlir_compiler # Stores the MLIRCompiler instance
+        self.mlir_string = mlir_compiler.get_module_string() # Get initial string
+
+        # For v0.1 efficient parameter updates (Python level)
+        self.circuit_ref = None # Will hold the executable Circuit
+        self._kernel_func = kernel_func
+        self._static_args = static_args # Args to kernel other than params & circuit
+        self._simulator_ref = simulator_ref # To re-create circuit if needed, or manage state reset
 
     def __repr__(self):
+        # Update the string representation if the module was modified
+        self.mlir_string = self.mlir_compiler.get_module_string()
         return f"<QuantumProgram name='{self.name}' num_qubits={self.num_qubits}>\nMLIR:\n{self.mlir_string}"
+
+    def dump(self):
+        """Dumps the internal MLIR module to stderr."""
+        self.mlir_compiler.dump_module()
+
+    def update_params(self, *params):
+        """
+        Updates the parameters of the quantum program.
+        For v0.1, this re-applies the Python kernel to the stored circuit_ref
+        with new parameters.
+        """
+        if self.circuit_ref is None:
+            # This might happen if the initial build didn't execute the circuit
+            # (e.g., if simulator was None in build).
+            # We might need to create/re-initialize the circuit here.
+            if self._simulator_ref and self._kernel_func:
+                print("Re-initializing circuit for update_params as circuit_ref was None.")
+                self.circuit_ref = Circuit(self.num_qubits, self._simulator_ref)
+            else:
+                raise RuntimeError("Cannot update params: circuit_ref is None and no simulator/kernel info to rebuild.")
+
+        if not self._kernel_func:
+            raise RuntimeError("Cannot update params: Kernel function not stored in QuantumProgram.")
+
+        # Reset the state of circuit_ref to |0...0> before applying gates with new params
+        # This assumes the Circuit object has a way to re-initialize its state,
+        # or we create a new one if necessary (but that defeats some efficiency).
+        # For simplicity, let's assume initialize_state can be called on an existing allocated state.
+        if self.circuit_ref.is_multi_gpu:
+             backend.initialize_distributed_state(self.circuit_ref._sim_handle)
+        else:
+            status = backend.initialize_state(self.circuit_ref._sim_handle,
+                                              self.circuit_ref._get_d_state_for_backend(),
+                                              self.circuit_ref.num_qubits)
+            if status != backend.rocqStatus.SUCCESS:
+                raise RuntimeError(f"Failed to re-initialize state for param update: {status}")
+
+        # Call the original Python kernel with the circuit and new params
+        kernel_args_for_py_call = [self.circuit_ref]
+        if self._static_args:
+            kernel_args_for_py_call.extend(self._static_args)
+        kernel_args_for_py_call.extend(params)
+
+        func_to_call = self._kernel_func.__wrapped__ if hasattr(self._kernel_func, '__wrapped__') else self._kernel_func
+        func_to_call(*kernel_args_for_py_call)
 
 
 def kernel(func):
@@ -501,23 +555,77 @@ def build(kernel_func, num_qubits: int, simulator: Simulator, *args) -> QuantumP
 
     print(f"--- Conceptual MLIR for kernel '{kernel_func.__name__}' ---")
     # Pass (num_qubits, *args) to generate_mlir because the kernel's first arg (circuit/qreg) is implicit in MLIR context
-    mlir_str = kernel_func.generate_mlir((num_qubits,) + args, {})
-    print(mlir_str)
+    mlir_string_from_ast = kernel_func.generate_mlir((num_qubits,) + args, {})
+    print(mlir_string_from_ast)
     print("----------------------------------------------------")
 
-    program = QuantumProgram(kernel_func.__name__, num_qubits, mlir_str)
+    # Create an MLIRCompiler instance and load the string
+    compiler_instance = backend.MLIRCompiler()
+    if not compiler_instance.initialize_module(kernel_func.__name__ + "_module"):
+        raise RuntimeError("Failed to initialize MLIR module in compiler.")
 
-    # For VQE v0.1 to still work somewhat, we can execute the original kernel logic
-    # This part makes `build` dual-purpose for now: generate MLIR and execute for v0.1 get_expval.
-    # This is a temporary bridge.
+    # The mlir_string_from_ast is just for printing/conceptual validation for now.
+    # Actual Op building will happen directly using compiler_instance if we enhance generate_mlir further.
+    # For now, load_module_from_string can be used if we have a full MLIR text representation.
+    # Since generate_mlir currently produces a string, let's use it.
+
+    # Create the main function signature in the MLIR module
+    # Argument types: num_qubits of !quantum.qubit, then types for *args
+    # For simplicity, assume *args are all f64 for now if they are parameters.
+    # This is a conceptual step; the string generated by generate_mlir will overwrite this.
+    qubit_type_str = "!quantum.qubit" # As defined in our dialect
+    # param_type_str = "f64" # Builtin MLIR float type
+
+    # Construct arg_type_strs for create_function based on num_qubits and kernel *args
+    # The kernel_func.generate_mlir still generates the full func string with its own arg list.
+    # The create_function call here is more for testing the binding and future direct op construction.
+    # The string from generate_mlir will overwrite the module.
+
+    # For this step, the string generated by kernel_func.generate_mlir will be used by load_module_from_string
+    # This means the function signature in that string is what matters for parsing.
+    # The call to compiler_instance.create_function is therefore somewhat redundant for *this exact flow*
+    # but sets up for the next phase where generate_mlir will call OpBuilder methods.
+
+    # Let's call create_function just to ensure it works, but its output won't be directly used
+    # if load_module_from_string replaces the whole module.
+    # To make it more meaningful: initialize an empty module, then parse string into it.
+    # The string from generate_mlir should be a full module string.
+
+    # kernel_func.generate_mlir produces a string like:
+    # func.func @kernel_name(%q0: !quantum.qubit, %q1: !quantum.qubit, %theta: f64) { ... }
+    # So, load_module_from_string will parse this directly.
+    # No need to call compiler_instance.create_function separately if the string contains the func.
+
+    if not compiler_instance.load_module_from_string(mlir_string_from_ast): # This parses the string
+        print(f"Warning: Failed to parse generated MLIR string for {kernel_func.__name__}. The program's MLIR module might be empty or invalid.")
+        # Ensure a valid (even if empty) module exists in compiler_instance
+        # Re-initialize an empty module.
+        if not compiler_instance.initialize_module(kernel_func.__name__ + "_fallback_module"):
+             raise RuntimeError("Fallback module initialization failed.")
+
+
+    # Store kernel_func and static args for potential re-application in update_params
+    # args passed to build are the initial *dynamic* parameters for the first run.
+    # If the kernel had other static args, they'd need to be handled differently,
+    # but current VQE example passes all dynamic params directly.
+    program = QuantumProgram(kernel_func.__name__,
+                             num_qubits,
+                             compiler_instance,
+                             kernel_func=kernel_func, # Store the original Python kernel
+                             static_args=None,      # Assuming no other static args for now
+                             simulator_ref=simulator)
+
+    # Initial execution of the circuit for v0.1 compatibility (get_expval needs it)
     if simulator:
         if not isinstance(simulator, Simulator):
              raise TypeError("A valid rocQ Simulator object is required if execution is expected.")
-        qcircuit = Circuit(num_qubits, simulator)
-        original_kernel_args = [qcircuit] + list(args)
+
+        # Create the circuit using the simulator stored in program
+        program.circuit_ref = Circuit(num_qubits, program._simulator_ref)
+
+        kernel_args_for_py_call = [program.circuit_ref] + list(args)
         func_to_call = kernel_func.__wrapped__ if hasattr(kernel_func, '__wrapped__') else kernel_func
-        func_to_call(*original_kernel_args)
-        program.circuit_ref = qcircuit # Store the executed circuit for get_expval
+        func_to_call(*kernel_args_for_py_call)
 
     return program
 
@@ -616,10 +724,42 @@ def get_expval(program: QuantumProgram, hamiltonian: PauliOperator) -> float:
             else: # Should not happen due to PauliOperator parsing
                 raise NotImplementedError(f"Expectation value for Pauli '{pauli_char}' not supported in get_expval.")
         elif not pauli_ops_list: # Identity term
-             pass # Already handled: term_expval = 1.0, total_expval += coeff * 1.0
-        else:
-            # Product of Paulis, e.g., Z0 Z1
-            raise NotImplementedError("Expectation value for products of Paulis (e.g., 'Z0 Z1') not yet supported in v0.1 get_expval.")
+             term_expval = 1.0 # <I> is 1
+        else: # Product of Paulis
+            is_all_z = True
+            target_z_qubits = []
+            for p_char, q_idx in pauli_ops_list:
+                if p_char != 'Z':
+                    is_all_z = False
+                    break
+                target_z_qubits.append(q_idx)
+
+            if is_all_z:
+                if not target_z_qubits: # Should be caught by "if not pauli_ops_list" but defensive
+                    term_expval = 1.0
+                else:
+                    try:
+                        # Sort qubit indices as backend might expect a canonical order, though not strictly necessary for Z product value
+                        # target_z_qubits.sort()
+                        term_expval = backend.get_expectation_value_pauli_product_z(
+                            circuit._sim_handle,
+                            circuit._get_d_state_for_backend(),
+                            circuit.num_qubits,
+                            target_z_qubits
+                        )
+                    except AttributeError:
+                        raise NotImplementedError(
+                            "Backend function 'get_expectation_value_pauli_product_z' is not yet bound or implemented."
+                        )
+                    except RuntimeError as e:
+                        op_str = " ".join([f"Z{q}" for q in target_z_qubits])
+                        raise RuntimeError(f"Error calculating <{op_str}>: {e}")
+            else:
+                # Product involves X or Y, which requires basis changes for each X/Y term first
+                # This is more complex: need to apply basis changes, then call ProductZ, then revert.
+                # For now, not implemented for general products with X/Y.
+                op_str = " ".join([f"{p_char}{q_idx}" for p_char, q_idx in pauli_ops_list])
+                raise NotImplementedError(f"Expectation value for general Pauli products like '{op_str}' not yet supported. Only products of Zs.")
 
         total_expval += coeff * term_expval
 

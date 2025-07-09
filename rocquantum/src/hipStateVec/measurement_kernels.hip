@@ -276,3 +276,112 @@ __global__ void reduce_block_sums_to_slice_total_sum_sq_mag_kernel(
         d_slice_total_sum_sq_mag_out[0] = s_reduce_sum_sq[0];
     }
 }
+
+// Kernel to calculate probabilities for 2^k outcomes of k target Z measurements.
+// Output: d_outcome_probs_blocks - an array where each block writes its 2^k partial probability sums.
+// The size of d_outcome_probs_blocks should be gridDim.x * (1 << num_target_paulis).
+__global__ void calculate_multi_z_probabilities_kernel(
+    const rocComplex* local_slice_data,
+    size_t local_slice_num_elements,
+    unsigned num_local_qubits,         // Total qubits in this slice/state_vector
+    const unsigned* d_target_qubits,   // Device array of target qubit indices (local to slice)
+    unsigned num_target_paulis,        // Number of Z paulistrings in the product (k)
+    real_t* d_outcome_probs_blocks) {  // Output for block-level sums
+
+    unsigned int KERNEL_MAX_TARGET_PAULIS = 8; // Max k for this kernel (2^8=256 outcomes)
+                                              // Adjust based on shared memory limits / complexity.
+                                              // For >8, might need different strategy or multiple passes.
+    if (num_target_paulis == 0 || num_target_paulis > KERNEL_MAX_TARGET_PAULIS) {
+        // Or handle error, assert, etc. For now, just return if invalid.
+        // If num_target_paulis is 0, result is just total sum of squares (norm), which is 1.0.
+        // The calling C++ function should handle num_target_paulis = 0 separately.
+        return;
+    }
+
+    unsigned num_outcomes = 1 << num_target_paulis; // 2^k
+
+    // Shared memory for per-block reduction of 2^k probabilities
+    // Max size: 256 * sizeof(real_t) for KERNEL_MAX_TARGET_PAULIS = 8
+    extern __shared__ real_t s_prob_bins[]; // Size should be blockDim.x * num_outcomes if each thread had its own bins
+                                         // Or just num_outcomes if we reduce carefully.
+                                         // Let's use num_outcomes and atomicAdd or careful per-thread accumulation.
+                                         // For a warp-level or block-level reduction, size is num_outcomes.
+
+    unsigned int tid_in_block = threadIdx.x;
+
+    // Initialize shared memory for this block
+    if (tid_in_block < num_outcomes) {
+        s_prob_bins[tid_in_block] = 0.0;
+    }
+    __syncthreads();
+
+    size_t global_idx_start = blockIdx.x * blockDim.x;
+
+    // Each thread iterates over its assigned elements from the slice
+    for (size_t i = tid_in_block; i < blockDim.x; i += blockDim.x) { // This loop over elements within a block's responsibility
+        size_t current_local_idx = global_idx_start + i;
+        if (current_local_idx < local_slice_num_elements) {
+            rocComplex amp = local_slice_data[current_local_idx];
+            real_t mag_sq = (real_t)amp.x * amp.x + (real_t)amp.y * amp.y;
+
+            // Determine the outcome bin for this amplitude
+            unsigned outcome_bin_idx = 0;
+            for (unsigned pauli_k = 0; pauli_k < num_target_paulis; ++pauli_k) {
+                unsigned target_q_idx = d_target_qubits[pauli_k]; // Qubit index for the k-th Pauli Z
+                if (((current_local_idx >> target_q_idx) & 1)) { // If this qubit is 1 for current amplitude
+                    outcome_bin_idx |= (1 << pauli_k); // Set the k-th bit in the outcome bin index
+                }
+            }
+            // Atomically add to the correct bin in shared memory
+            // This is okay for up to ~32-64 bins if contention is managed.
+            // For larger num_outcomes, a different reduction is needed.
+            // If num_outcomes is small (e.g., <= 64), atomicAdd on shared mem is often fine.
+            // Otherwise, each thread maintains its own num_outcomes bins and then reduce them.
+            // Let's assume num_target_paulis is small enough that num_outcomes is manageable for atomicAdd.
+            if (outcome_bin_idx < num_outcomes) { // Should always be true
+                 atomicAdd(&s_prob_bins[outcome_bin_idx], mag_sq);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Block leader (thread 0 in block) writes the block's sums to global memory
+    if (tid_in_block == 0) {
+        for (unsigned bin_k = 0; bin_k < num_outcomes; ++bin_k) {
+            d_outcome_probs_blocks[blockIdx.x * num_outcomes + bin_k] = s_prob_bins[bin_k];
+        }
+    }
+}
+
+// Kernel to reduce block-level sums of multi-Z outcome probabilities to slice totals.
+// d_block_outcome_probs: input from previous kernel, size: num_prev_blocks * num_outcomes
+// d_slice_total_outcome_probs: output, size: num_outcomes
+__global__ void reduce_multi_z_block_probs_to_slice_total_kernel(
+    const real_t* d_block_outcome_probs,
+    unsigned num_prev_blocks,
+    unsigned num_outcomes, // 2^k (number of Zs in product)
+    real_t* d_slice_total_outcome_probs) {
+
+    // Shared memory for reduction. Size: blockDim.x (if reducing one outcome bin per thread)
+    // or num_outcomes (if each thread sums for one outcome bin across blocks).
+    // Let's choose the latter: each thread in this kernel is responsible for one outcome bin.
+    // So, this kernel should be launched with num_outcomes threads (if num_outcomes <= max_block_size).
+    extern __shared__ real_t s_final_probs[]; // Size: num_outcomes (passed as shared mem size at launch)
+
+    unsigned int outcome_idx_this_thread = threadIdx.x + blockIdx.x * blockDim.x; // This thread handles this outcome_idx
+
+    if (outcome_idx_this_thread < num_outcomes) {
+        real_t my_sum_for_this_outcome = 0.0;
+        // Sum probabilities for outcome_idx_this_thread across all blocks from previous kernel
+        for (unsigned block_i = 0; block_i < num_prev_blocks; ++block_i) {
+            my_sum_for_this_outcome += d_block_outcome_probs[block_i * num_outcomes + outcome_idx_this_thread];
+        }
+        s_final_probs[outcome_idx_this_thread] = my_sum_for_this_outcome; // Storing in shared, though not strictly needed if 1 block
+                                                                    // and writing directly to global.
+                                                                    // If launched with 1 block, num_outcomes threads:
+        d_slice_total_outcome_probs[outcome_idx_this_thread] = my_sum_for_this_outcome;
+    }
+    // If launched with multiple blocks, a further reduction of s_final_probs would be needed.
+    // For now, assume this kernel is launched with 1 block and num_outcomes threads.
+    // The C++ host code will need to ensure this launch configuration.
+}
