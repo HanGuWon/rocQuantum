@@ -208,6 +208,8 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
         return rocsvApplyS(h.get(), d_state.get_ptr<rocComplex>(), nQ, tQ); }, "Applies S gate");
     m.def("apply_t", [](const RocsvHandleWrapper& h, DeviceBuffer& d_state, unsigned nQ, unsigned tQ) {
         return rocsvApplyT(h.get(), d_state.get_ptr<rocComplex>(), nQ, tQ); }, "Applies T gate");
+    m.def("apply_sdg", [](const RocsvHandleWrapper& h, DeviceBuffer& d_state, unsigned nQ, unsigned tQ) {
+        return rocsvApplySdg(h.get(), d_state.get_ptr<rocComplex>(), nQ, tQ); }, "Applies S dagger gate");
 
     // Rotation gates
     m.def("apply_rx", [](const RocsvHandleWrapper& h, DeviceBuffer& d_state, unsigned nQ, unsigned tQ, double angle) {
@@ -289,6 +291,38 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
             return result;
         }, py::arg("handle"), py::arg("d_state"), py::arg("num_qubits"), py::arg("target_qubit"),
            "Calculates <Z_k> for the target qubit.");
+
+    m.def("get_expectation_value_x",
+        [](const RocsvHandleWrapper& handle_wrapper, DeviceBuffer& d_state_buffer, unsigned numQubits, unsigned targetQubit) {
+            double result = 0.0;
+            rocqStatus_t status = rocsvGetExpectationValueSinglePauliX(
+                                               handle_wrapper.get(),
+                                               d_state_buffer.get_ptr<rocComplex>(),
+                                               numQubits,
+                                               targetQubit,
+                                               &result);
+            if (status != ROCQ_STATUS_SUCCESS) {
+                throw std::runtime_error("rocsvGetExpectationValueSinglePauliX failed: " + std::to_string(status));
+            }
+            return result;
+        }, py::arg("handle"), py::arg("d_state"), py::arg("num_qubits"), py::arg("target_qubit"),
+           "Calculates <X_k> for the target qubit. Modifies state vector.");
+
+    m.def("get_expectation_value_y",
+        [](const RocsvHandleWrapper& handle_wrapper, DeviceBuffer& d_state_buffer, unsigned numQubits, unsigned targetQubit) {
+            double result = 0.0;
+            rocqStatus_t status = rocsvGetExpectationValueSinglePauliY(
+                                               handle_wrapper.get(),
+                                               d_state_buffer.get_ptr<rocComplex>(),
+                                               numQubits,
+                                               targetQubit,
+                                               &result);
+            if (status != ROCQ_STATUS_SUCCESS) {
+                throw std::runtime_error("rocsvGetExpectationValueSinglePauliY failed: " + std::to_string(status));
+            }
+            return result;
+        }, py::arg("handle"), py::arg("d_state"), py::arg("num_qubits"), py::arg("target_qubit"),
+           "Calculates <Y_k> for the target qubit. Modifies state vector.");
 
     // Add a helper to create a DeviceBuffer and copy a numpy array to it
     m.def("create_device_matrix_from_numpy",

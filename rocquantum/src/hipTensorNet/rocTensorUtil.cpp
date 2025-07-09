@@ -296,68 +296,180 @@ bool parse_simple_einsum_spec(
     std::string tensorB_spec_str = inputs_str.substr(comma_pos + 1);
 
     // Extract labels for A, B, and Result
-    // Assuming labels are single characters for this simple parser.
-    // Tensor names like "A(" are ignored for now, directly use tensorA->labels_
-    std::string labelsA_str, labelsB_str, labelsRes_str;
-    size_t p_open = tensorA_spec_str.find('('); size_t p_close = tensorA_spec_str.find(')');
-    if (p_open != std::string::npos && p_close != std::string::npos && p_close > p_open)
-        labelsA_str = tensorA_spec_str.substr(p_open + 1, p_close - p_open - 1);
-    else labelsA_str = tensorA_spec_str; // Assume raw labels if no parens
+    // Helper to trim whitespace from a string
+    auto trim_string = [](std::string& s) {
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+        s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), s.end());
+    };
 
-    p_open = tensorB_spec_str.find('('); p_close = tensorB_spec_str.find(')');
-    if (p_open != std::string::npos && p_close != std::string::npos && p_close > p_open)
-        labelsB_str = tensorB_spec_str.substr(p_open + 1, p_close - p_open - 1);
-    else labelsB_str = tensorB_spec_str;
+    // Helper to split a string by a delimiter
+    auto split_string = [&](const std::string& s, char delimiter) {
+        std::vector<std::string> tokens;
+        std::string token;
+        std::istringstream tokenStream(s);
+        while (std::getline(tokenStream, token, delimiter)) {
+            trim_string(token);
+            if (!token.empty()) {
+                tokens.push_back(token);
+            }
+        }
+        return tokens;
+    };
 
-    // For result, could also have name C(...)
-    p_open = output_str.find('('); p_close = output_str.find(')');
-     if (p_open != std::string::npos && p_close != std::string::npos && p_close > p_open)
-        labelsRes_str = output_str.substr(p_open + 1, p_close - p_open - 1);
-    else labelsRes_str = output_str;
+    bool implicit_output = false;
+    size_t arrow_pos = spec.find("->");
+    std::string inputs_str;
+    std::string output_spec_str;
 
+    if (arrow_pos == std::string::npos) {
+        implicit_output = true;
+        inputs_str = spec;
+    } else {
+        inputs_str = spec.substr(0, arrow_pos);
+        output_spec_str = spec.substr(arrow_pos + 2);
+        trim_string(output_spec_str);
+    }
+    trim_string(inputs_str);
 
-    if (labelsA_str.length() != tensorA->rank() || labelsB_str.length() != tensorB->rank()) return false; // Label count mismatch
+    size_t comma_pos = inputs_str.find(',');
+    if (comma_pos == std::string::npos) return false; // Must have two input tensors
 
-    std::map<char, int> map_A_label_to_idx;
-    std::map<char, int> map_B_label_to_idx;
-    for(size_t i=0; i<labelsA_str.length(); ++i) map_A_label_to_idx[labelsA_str[i]] = i;
-    for(size_t i=0; i<labelsB_str.length(); ++i) map_B_label_to_idx[labelsB_str[i]] = i;
+    std::string tensorA_spec_str = inputs_str.substr(0, comma_pos);
+    std::string tensorB_spec_str = inputs_str.substr(comma_pos + 1);
+    trim_string(tensorA_spec_str);
+    trim_string(tensorB_spec_str);
 
-    std::set<char> labels_A_set(labelsA_str.begin(), labelsA_str.end());
-    std::set<char> labels_B_set(labelsB_str.begin(), labelsB_str.end());
-    std::set<char> labels_Res_set(labelsRes_str.begin(), labelsRes_str.end());
+    // Extract labels for A, B, and Result
+    // Supports "A(label1,label2)" or just "label1,label2" or "label1 label2" (space as secondary delimiter)
+    auto extract_labels_from_spec = [&](const std::string& tensor_spec, size_t expected_rank) {
+        std::string actual_labels_str = tensor_spec;
+        size_t p_open = tensor_spec.find('(');
+        size_t p_close = tensor_spec.find(')');
+        if (p_open != std::string::npos && p_close != std::string::npos && p_close > p_open) {
+            actual_labels_str = tensor_spec.substr(p_open + 1, p_close - p_open - 1);
+        }
+
+        std::vector<std::string> labels_vec = split_string(actual_labels_str, ',');
+        if (labels_vec.empty() && !actual_labels_str.empty()) { // Try space delimiter if comma yields nothing but string is not empty
+             labels_vec = split_string(actual_labels_str, ' ');
+        }
+        if (labels_vec.size() != expected_rank) return std::vector<std::string>(); // Mismatch
+        return labels_vec;
+    };
+
+    std::vector<std::string> labelsA_vec = extract_labels_from_spec(tensorA_spec_str, tensorA->rank());
+    std::vector<std::string> labelsB_vec = extract_labels_from_spec(tensorB_spec_str, tensorB->rank());
+    std::vector<std::string> labelsRes_vec;
+
+    if (labelsA_vec.empty() || labelsB_vec.empty()) return false; // Label count mismatch or parsing error
+
+    if (!implicit_output) {
+        labelsRes_vec = extract_labels_from_spec(output_spec_str, 0); // Pass 0 as expected rank, will be checked later
+        if (labelsRes_vec.empty() && !output_spec_str.empty() && output_spec_str != "scalar") return false; // If output specified but not parsed
+    }
+
+    std::map<std::string, int> map_A_label_to_idx;
+    std::map<std::string, int> map_B_label_to_idx;
+    for(size_t i=0; i<labelsA_vec.size(); ++i) map_A_label_to_idx[labelsA_vec[i]] = i;
+    for(size_t i=0; i<labelsB_vec.size(); ++i) map_B_label_to_idx[labelsB_vec[i]] = i;
+
+    std::set<std::string> labels_A_set(labelsA_vec.begin(), labelsA_vec.end());
+    std::set<std::string> labels_B_set(labelsB_vec.begin(), labelsB_vec.end());
+    std::set<std::string> labels_Res_set(labelsRes_vec.begin(), labelsRes_vec.end());
 
     // Find contracted indices
-    for (char label_char : labelsA_str) {
-        if (labels_B_set.count(label_char) && !labels_Res_set.count(label_char)) { // Contracted
-            int modeA_idx = map_A_label_to_idx[label_char];
-            int modeB_idx = map_B_label_to_idx[label_char];
-            if (tensorA->dimensions_[modeA_idx] != tensorB->dimensions_[modeB_idx]) return false; // Dim mismatch
-            contracted_pairs_A_B.push_back({modeA_idx, modeB_idx});
+    for (const std::string& label_str : labelsA_vec) {
+        if (labels_B_set.count(label_str)) { // Potential contraction
+            bool is_in_result = implicit_output ? false : labels_Res_set.count(label_str);
+            if (!is_in_result) { // Contracted if in A and B, but not in result (or if result is implicit)
+                int modeA_idx = map_A_label_to_idx[label_str];
+                int modeB_idx = map_B_label_to_idx[label_str];
+                if (tensorA->dimensions_[modeA_idx] != tensorB->dimensions_[modeB_idx]) return false; // Dim mismatch
+                contracted_pairs_A_B.push_back({modeA_idx, modeB_idx});
+            }
         }
     }
 
-    // Determine result mode order and dimensions based on labelsRes_str
-    for (char res_label_char : labelsRes_str) {
-        if (labels_A_set.count(res_label_char) && !labels_B_set.count(res_label_char)) { // From A only
-            int modeA_idx = map_A_label_to_idx[res_label_char];
+    if (implicit_output) {
+        // Deduce result labels: uncontracted A, then uncontracted B
+        std::set<std::string> contracted_label_set;
+        for(const auto& p : contracted_pairs_A_B) {
+            contracted_label_set.insert(labelsA_vec[p.first]);
+        }
+        for(const std::string& label_A : labelsA_vec) {
+            if (!contracted_label_set.count(label_A)) {
+                labelsRes_vec.push_back(label_A);
+            }
+        }
+        for(const std::string& label_B : labelsB_vec) {
+            if (!contracted_label_set.count(label_B) && !labels_A_set.count(label_B)) { // Ensure not already added from A if A had same uncontracted label
+                labelsRes_vec.push_back(label_B);
+            }
+        }
+        labels_Res_set.insert(labelsRes_vec.begin(), labelsRes_vec.end()); // Update Res_set for logic below
+    }
+
+
+    // Determine result mode order and dimensions based on labelsRes_vec
+    for (const std::string& res_label_str : labelsRes_vec) {
+        if (labels_A_set.count(res_label_str) && !labels_B_set.count(res_label_str)) { // From A only
+            bool is_contracted = false; // Check if this label from A was actually part of a contracted pair
+            for(const auto& p : contracted_pairs_A_B) if(labelsA_vec[p.first] == res_label_str) is_contracted = true;
+            if(is_contracted) return false; // Result label cannot be a contracted one from A
+
+            int modeA_idx = map_A_label_to_idx[res_label_str];
             result_A_modes_order.push_back(modeA_idx);
             result_dims.push_back(tensorA->dimensions_[modeA_idx]);
-            result_labels.push_back(std::string(1, res_label_char));
-        } else if (labels_B_set.count(res_label_char) && !labels_A_set.count(res_label_char)) { // From B only
-            int modeB_idx = map_B_label_to_idx[res_label_char];
+            result_labels.push_back(res_label_str);
+        } else if (labels_B_set.count(res_label_str) && !labels_A_set.count(res_label_str)) { // From B only
+            bool is_contracted = false;
+            for(const auto& p : contracted_pairs_A_B) if(labelsB_vec[p.second] == res_label_str) is_contracted = true;
+            if(is_contracted) return false; // Result label cannot be a contracted one from B
+
+            int modeB_idx = map_B_label_to_idx[res_label_str];
             result_B_modes_order.push_back(modeB_idx);
             result_dims.push_back(tensorB->dimensions_[modeB_idx]);
-            result_labels.push_back(std::string(1, res_label_char));
-        } else if (labels_A_set.count(res_label_char) && labels_B_set.count(res_label_char)) {
-            return false; // Label appears in both A and B AND in Result - ambiguous for simple contraction
-        } else {
-            return false; // Result label not found in inputs
+            result_labels.push_back(res_label_str);
+        } else if (labels_A_set.count(res_label_str) && labels_B_set.count(res_label_str)) {
+             // Label appears in both A and B AND in Result - this means it was NOT contracted.
+             // This case is complex for simple einsum. Usually, if a label appears in A, B, and Result,
+             // it implies a diagonal/batch operation, not a standard GEMM-based contraction.
+             // For this parser, disallow this unless it's the *only* way it's uncontracted.
+             // Simpler: if it's common to A and B, it MUST be contracted (not in result for implicit, or explicitly not in result for explicit)
+             bool is_actually_contracted = false;
+             for(const auto& p : contracted_pairs_A_B) {
+                 if (labelsA_vec[p.first] == res_label_str && labelsB_vec[p.second] == res_label_str) {
+                     is_actually_contracted = true;
+                     break;
+                 }
+             }
+             if (is_actually_contracted) return false; // A result label cannot be one that was contracted.
+
+            // If it's in A, B, and Res, and NOT contracted, it's an "outer product" like mode.
+            // This parser might not support this robustly. Standard einsum usually means such labels are summed out if not in output.
+            // For now, let's assume if it's in A, B, and Res, it's an error for this simplified parser.
+            return false;
+        } else if (res_label_str == "scalar" && labelsRes_vec.size()==1) {
+            // Handled by the empty result_dims check later
+        }
+         else {
+            return false; // Result label not found in uncontracted parts of inputs
         }
     }
-    if (result_dims.empty() && !contracted_pairs_A_B.empty()) { // Scalar result from full contraction
+
+    // Final check for output spec consistency
+    if (!implicit_output && labelsRes_vec.size() != result_dims.size()) {
+        if (!(labelsRes_vec.empty() && output_spec_str == "scalar" && result_dims.size() == 1 && result_dims[0] == 1) &&
+            !(labelsRes_vec.size()==1 && labelsRes_vec[0]=="scalar" && result_dims.size() == 1 && result_dims[0] == 1) &&
+            !(labelsRes_vec.empty() && result_dims.empty() && contracted_pairs_A_B.size() == tensorA->rank() && contracted_pairs_A_B.size() == tensorB->rank()) // full scalar contraction
+        )
+        return false; // Mismatch between specified output labels and derived output structure
+    }
+
+
+    if (result_dims.empty() && (!contracted_pairs_A_B.empty() || (tensorA->rank()==0 && tensorB->rank()==0) ) ) { // Scalar result
         result_dims.push_back(1);
-        result_labels.push_back("scalar");
+        if (result_labels.empty()) result_labels.push_back("scalar");
     }
 
     return true;

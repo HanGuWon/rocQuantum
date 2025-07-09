@@ -98,6 +98,7 @@ __global__ void apply_Z_kernel(rocComplex* state, unsigned numQubits, unsigned t
 __global__ void apply_H_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit);
 __global__ void apply_S_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit);
 __global__ void apply_T_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit);
+__global__ void apply_Sdg_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit); // Added Sdg
 __global__ void apply_Rx_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, real_t theta); // Uses real_t
 __global__ void apply_Ry_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, real_t theta); // Uses real_t
 __global__ void apply_Rz_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, real_t theta); // Uses real_t
@@ -1057,6 +1058,43 @@ rocqStatus_t rocsvApplyX(rocsvHandle_t handle, rocComplex* d_state, unsigned num
         unsigned num_blocks = (num_thread_groups + threads_per_block - 1) / threads_per_block;
         if (num_thread_groups > 0 && num_blocks == 0) num_blocks = 1;
         else if (num_thread_groups == 0) {
+             if (local_num_qubits_for_kernel == 0 && targetQubitLocal == 0 && local_slice_num_elements == 1) num_blocks = 0;
+             else if (local_num_qubits_for_kernel == 1 && local_slice_num_elements == 2) num_blocks = 1;
+             else num_blocks = 0;
+        }
+        if (local_slice_num_elements == 0 && current_global_qubits > 0 && h->numGpus > 0) num_blocks = 0;
+        for(int rank=0; rank < h->numGpus; ++rank) {
+            hipError_t hip_err_set = hipSetDevice(h->deviceIds[rank]);
+            if (hip_err_set != hipSuccess) { status = checkHipError(hip_err_set, "rocsvApplyT hipSetDevice"); break; }
+            if (h->d_local_state_slices[rank] == nullptr && h->localStateSizes[rank] > 0) { status = ROCQ_STATUS_INVALID_VALUE; break; }
+            if (h->localStateSizes[rank] != local_slice_num_elements && h->numGpus > 1 && h->globalNumQubits > 0) {status = ROCQ_STATUS_INVALID_VALUE; break;}
+            if(num_blocks > 0 && h->localStateSizes[rank] > 0) {
+                hipLaunchKernelGGL(apply_T_kernel,dim3(num_blocks),dim3(threads_per_block),0,h->streams[rank],h->d_local_state_slices[rank],local_num_qubits_for_kernel,targetQubitLocal);
+                if(hipGetLastError()!=hipSuccess){status = ROCQ_STATUS_HIP_ERROR; break;}
+            }
+            if(hipStreamSynchronize(h->streams[rank])!=hipSuccess){status = ROCQ_STATUS_HIP_ERROR; break;}
+        }
+        return status;
+    } else return ROCQ_STATUS_NOT_IMPLEMENTED;
+}
+
+rocqStatus_t rocsvApplySdg(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit) {
+    if (!handle) return ROCQ_STATUS_INVALID_VALUE;
+    rocsvInternalHandle* h = static_cast<rocsvInternalHandle*>(handle);
+    if (h->numGpus == 0) return ROCQ_STATUS_FAILURE;
+    unsigned current_global_qubits = (h->globalNumQubits > 0) ? h->globalNumQubits : numQubits;
+    if (targetQubit >= current_global_qubits) return ROCQ_STATUS_INVALID_VALUE;
+    if (current_global_qubits == 0 && targetQubit > 0) return ROCQ_STATUS_INVALID_VALUE;
+    if (are_qubits_local(h, &targetQubit, 1)) {
+        unsigned local_num_qubits_for_kernel = h->numLocalQubitsPerGpu;
+        size_t local_slice_num_elements = (1ULL << local_num_qubits_for_kernel);
+        unsigned targetQubitLocal = targetQubit;
+        rocqStatus_t status = ROCQ_STATUS_SUCCESS;
+        unsigned threads_per_block = 256;
+        size_t num_thread_groups = (local_slice_num_elements > 0) ? local_slice_num_elements / 2 : 0;
+        unsigned num_blocks = (num_thread_groups + threads_per_block - 1) / threads_per_block;
+        if (num_thread_groups > 0 && num_blocks == 0) num_blocks = 1;
+        else if (num_thread_groups == 0) {
              if (local_num_qubits_for_kernel == 0 && targetQubitLocal == 0 && local_slice_num_elements == 1) num_blocks = 0; // Rx for 0 qubit state is identity effectively
              else if (local_num_qubits_for_kernel == 1 && local_slice_num_elements == 2) num_blocks = 1;
              else num_blocks = 0;
@@ -1499,5 +1537,70 @@ rocqStatus_t rocsvApplySWAP(rocsvHandle_t handle, rocComplex* d_state, unsigned 
         return status;
     } else return ROCQ_STATUS_NOT_IMPLEMENTED;
 }
+
+rocqStatus_t rocsvGetExpectationValueSinglePauliX(rocsvHandle_t handle,
+                                                  rocComplex* d_state, // Legacy for single GPU, ignored for multi-GPU
+                                                  unsigned numQubits,
+                                                  unsigned targetQubit,
+                                                  double* result) {
+    if (!handle || !result) return ROCQ_STATUS_INVALID_VALUE;
+    rocqStatus_t status;
+
+    // Apply H to targetQubit
+    status = rocsvApplyH(handle, d_state, numQubits, targetQubit);
+    if (status != ROCQ_STATUS_SUCCESS) return status;
+
+    // Calculate <Z> for targetQubit on the H-rotated state
+    status = rocsvGetExpectationValueSinglePauliZ(handle, d_state, numQubits, targetQubit, result);
+    if (status != ROCQ_STATUS_SUCCESS) {
+        // Attempt to revert H gate even if <Z> fails, to restore state
+        rocsvApplyH(handle, d_state, numQubits, targetQubit); // Best effort
+        return status;
+    }
+
+    // Apply H again to revert to original basis
+    status = rocsvApplyH(handle, d_state, numQubits, targetQubit);
+    return status;
+}
+
+rocqStatus_t rocsvGetExpectationValueSinglePauliY(rocsvHandle_t handle,
+                                                  rocComplex* d_state, // Legacy for single GPU, ignored for multi-GPU
+                                                  unsigned numQubits,
+                                                  unsigned targetQubit,
+                                                  double* result) {
+    if (!handle || !result) return ROCQ_STATUS_INVALID_VALUE;
+    rocqStatus_t status;
+
+    // Basis change for Y: H Sdg
+    // Apply Sdg
+    status = rocsvApplySdg(handle, d_state, numQubits, targetQubit);
+    if (status != ROCQ_STATUS_SUCCESS) return status;
+
+    // Apply H
+    status = rocsvApplyH(handle, d_state, numQubits, targetQubit);
+    if (status != ROCQ_STATUS_SUCCESS) {
+        rocsvApplyS(handle, d_state, numQubits, targetQubit); // Best effort S to revert Sdg
+        return status;
+    }
+
+    // Calculate <Z> for targetQubit on the rotated state
+    status = rocsvGetExpectationValueSinglePauliZ(handle, d_state, numQubits, targetQubit, result);
+    if (status != ROCQ_STATUS_SUCCESS) {
+        // Attempt to revert H and Sdg
+        rocsvApplyH(handle, d_state, numQubits, targetQubit); // Best effort H
+        rocsvApplyS(handle, d_state, numQubits, targetQubit); // Best effort S
+        return status;
+    }
+
+    // Revert basis change: S H
+    // Apply H
+    status = rocsvApplyH(handle, d_state, numQubits, targetQubit);
+    if (status != ROCQ_STATUS_SUCCESS) return status; // If this fails, state is modified
+
+    // Apply S
+    status = rocsvApplyS(handle, d_state, numQubits, targetQubit);
+    return status;
+}
+
 
 } // extern "C"

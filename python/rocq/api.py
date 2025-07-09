@@ -375,63 +375,165 @@ class PauliOperator:
         return self.__mul__(scalar)
 
 
+import ast
+import inspect # To get source code for AST parsing
+
 # Global/module level functions for rocHybrid v0.1
 # These will eventually interact with a more sophisticated Program object and compiler.
 
-_current_circuit_for_kernel = None
+class QuantumProgram:
+    """
+    Represents a "compiled" quantum program, initially just storing
+    a string representation of conceptual MLIR.
+    """
+    def __init__(self, name: str, num_qubits: int, mlir_string: str):
+        self.name = name
+        self.num_qubits = num_qubits
+        self.mlir_string = mlir_string
+        self.circuit_ref = None # Will hold the executable Circuit for v0.1
+
+    def __repr__(self):
+        return f"<QuantumProgram name='{self.name}' num_qubits={self.num_qubits}>\nMLIR:\n{self.mlir_string}"
+
 
 def kernel(func):
     """
     Decorator for quantum kernels.
-    For v0.1, this might not do much beyond marking the function.
-    In future, it would trigger AST introspection for MLIR conversion.
+    For v0.1, this will attach AST parsing capabilities to the function.
     """
-    # For now, just return the function as is, or wrap it if needed for context.
-    # To make it work with the VQE example structure, the kernel needs to operate on a Circuit object.
-    # This implies the Circuit object needs to be available when the kernel is called.
+    def generate_mlir_for_call(kernel_args, kernel_kwargs):
+        """
+        Parses the AST of the decorated function `func` and generates
+        a conceptual MLIR string based on simple gate calls.
+        `kernel_args` are the arguments passed to the kernel at build time.
+        """
+        mlir_lines = []
+        try:
+            source = inspect.getsource(func)
+            tree = ast.parse(source)
 
-    # Let's try a simple approach: the kernel function will receive a Circuit object as its first argument.
-    # The @kernel decorator itself doesn't need to do much for v0.1 if build() handles creation.
+            # Assuming the first argument to the kernel is the circuit/qubit register placeholder
+            # And subsequent arguments are parameters.
+            # For simplicity, map kernel parameters to MLIR function arguments.
+
+            func_def = None
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef):
+                    func_def = node
+                    break
+
+            if not func_def:
+                mlir_lines.append("// Could not find FunctionDef in AST")
+                return "\n".join(mlir_lines)
+
+            # Create a simple mapping from kernel Python arg names to MLIR arg names for the conceptual MLIR
+            # The first Python arg is assumed to be the 'circuit' or 'qreg'
+            param_names = [arg.arg for arg in func_def.args.args[1:]] # Skip circuit/qreg
+
+            # Conceptual MLIR function signature
+            # Example: func @kernel_name(%qreg : !quantum.qreg<num_qubits>, %theta : f64) { ... }
+            # For now, we'll simplify and assume qubits are implicitly managed.
+            # And parameters are passed to gates directly.
+
+            mlir_lines.append(f"func.func @{func.__name__}({', '.join([f'%arg{i}: !quantum.qubit' for i in range(kernel_args[0])])}) {{") # kernel_args[0] is num_qubits
+
+            # Very basic AST traversal for Call nodes
+            for node in ast.walk(func_def):
+                if isinstance(node, ast.Call):
+                    # Check if it's a method call on the first argument (e.g., circuit.h())
+                    if isinstance(node.func, ast.Attribute) and \
+                       isinstance(node.func.value, ast.Name) and \
+                       node.func.value.id == func_def.args.args[0].arg: # Check if it's like 'circuit.gate()'
+
+                        gate_name = node.func.attr
+                        gate_args = node.args
+
+                        if gate_name == "h" and len(gate_args) == 1 and isinstance(gate_args[0], ast.Constant):
+                            qubit_idx = gate_args[0].value
+                            mlir_lines.append(f"  %q{qubit_idx}_h = \"quantum.gate\"(%q{qubit_idx}) {{ gate_name = \"H\" }} : (!quantum.qubit) -> !quantum.qubit")
+                        elif gate_name == "cx" and len(gate_args) == 2 and \
+                             isinstance(gate_args[0], ast.Constant) and isinstance(gate_args[1], ast.Constant):
+                            ctrl_idx = gate_args[0].value
+                            target_idx = gate_args[1].value
+                            mlir_lines.append(f"  %q{ctrl_idx}_cx, %q{target_idx}_cx = \"quantum.gate\"(%q{ctrl_idx}, %q{target_idx}) {{ gate_name = \"CX\" }} : (!quantum.qubit, !quantum.qubit) -> (!quantum.qubit, !quantum.qubit)")
+                        elif gate_name == "rx" and len(gate_args) == 2 and isinstance(gate_args[1], ast.Constant):
+                            # Parameter for Rx needs to be identified from kernel_args
+                            # This is a simplification: assumes param name in kernel matches call
+                            param_node = gate_args[0]
+                            qubit_idx = gate_args[1].value
+                            param_val_str = "UNKNOWN_PARAM"
+                            if isinstance(param_node, ast.Name) and param_node.id in param_names:
+                                try:
+                                    # Get actual value passed to kernel for this param
+                                    param_idx_in_kernel_args = param_names.index(param_node.id)
+                                    actual_param_value = kernel_args[1:][param_idx_in_kernel_args] # kernel_args[0] is num_qubits
+                                    param_val_str = str(actual_param_value)
+                                except (IndexError, ValueError):
+                                    pass # Keep UNKNOWN_PARAM
+                            mlir_lines.append(f"  %q{qubit_idx}_rx = \"quantum.gate\"(%q{qubit_idx}) {{ gate_name = \"RX\", params = [{param_val_str}] }} : (!quantum.qubit) -> !quantum.qubit")
+                        # Add more gate translations here...
+                        else:
+                            mlir_lines.append(f"  // Unrecognized gate call: {gate_name}")
+            mlir_lines.append("  return")
+            mlir_lines.append("}")
+
+        except Exception as e:
+            mlir_lines.append(f"// Error during AST parsing: {e}")
+
+        return "\n".join(mlir_lines)
+
+    # Attach the MLIR generation function to the decorated kernel function
+    func.generate_mlir = generate_mlir_for_call
     return func
 
 
-def build(kernel_func, num_qubits: int, simulator: Simulator, *args) -> Circuit :
+def build(kernel_func, num_qubits: int, simulator: Simulator, *args) -> QuantumProgram :
     """
     "Builds" a quantum program from a kernel function and its arguments.
-    For v0.1, this means:
-    1. Creating a Circuit instance.
-    2. Calling the kernel_func, passing the circuit and *args, allowing the kernel
-       to populate the circuit with gate operations.
+    For v0.1 MLIR scaffolding, this means:
+    1. Triggering the AST-based MLIR string generation.
+    2. Printing the MLIR string.
+    3. Returning a QuantumProgram object that might store this string.
+    The actual circuit execution is deferred/changed.
     """
-    if not isinstance(simulator, Simulator):
-        raise TypeError("A valid rocQ Simulator object is required for build.")
+    if not hasattr(kernel_func, 'generate_mlir'):
+        raise TypeError("The function provided to build() must be decorated with @rocq.kernel")
 
-    # For multi-GPU, circuit creation handles distributed state.
-    # We need to know if this build is for multi-GPU from simulator or an explicit flag.
-    # Assuming simulator handle already knows its GPU configuration.
-    # The Circuit constructor in api.py already takes a multi_gpu flag,
-    // but this is not easily known by build() unless passed explicitly or inferred from simulator.
-    # Let's assume the Circuit constructor handles this based on the simulator handle's state.
-    # For now, let's assume single GPU for simplicity of VQE v0.1 or pass it to build.
+    print(f"--- Conceptual MLIR for kernel '{kernel_func.__name__}' ---")
+    # Pass (num_qubits, *args) to generate_mlir because the kernel's first arg (circuit/qreg) is implicit in MLIR context
+    mlir_str = kernel_func.generate_mlir((num_qubits,) + args, {})
+    print(mlir_str)
+    print("----------------------------------------------------")
 
-    # The Circuit class already handles allocation and initialization.
-    qcircuit = Circuit(num_qubits, simulator) # Defaulting to single GPU unless Circuit infers from Simulator
+    program = QuantumProgram(kernel_func.__name__, num_qubits, mlir_str)
 
-    # Allow the kernel function to define itself on the circuit
-    kernel_func(qcircuit, *args) # Pass circuit as first arg, then other params
+    # For VQE v0.1 to still work somewhat, we can execute the original kernel logic
+    # This part makes `build` dual-purpose for now: generate MLIR and execute for v0.1 get_expval.
+    # This is a temporary bridge.
+    if simulator:
+        if not isinstance(simulator, Simulator):
+             raise TypeError("A valid rocQ Simulator object is required if execution is expected.")
+        qcircuit = Circuit(num_qubits, simulator)
+        original_kernel_args = [qcircuit] + list(args)
+        func_to_call = kernel_func.__wrapped__ if hasattr(kernel_func, '__wrapped__') else kernel_func
+        func_to_call(*original_kernel_args)
+        program.circuit_ref = qcircuit # Store the executed circuit for get_expval
 
-    return qcircuit
+    return program
 
 
-def get_expval(circuit: Circuit, hamiltonian: PauliOperator) -> float:
+def get_expval(program: QuantumProgram, hamiltonian: PauliOperator) -> float:
     """
     Calculates the expectation value of a Hamiltonian with respect to the state
     prepared by the circuit.
     <psi|H|psi>
     For v0.1, this will be simplified.
     """
-    if not isinstance(circuit, Circuit):
-        raise TypeError("Input circuit must be a rocQ Circuit object.")
+    # For v0.1, program.circuit_ref holds the executed Circuit object
+    if not isinstance(program, QuantumProgram) or not isinstance(program.circuit_ref, Circuit):
+        raise TypeError("Input must be a QuantumProgram object with an executed circuit_ref for v0.1 get_expval.")
+    circuit = program.circuit_ref # Use the executed circuit from the program object
+
     if not isinstance(hamiltonian, PauliOperator):
         raise TypeError("Input hamiltonian must be a rocQ PauliOperator object.")
 
@@ -472,17 +574,49 @@ def get_expval(circuit: Circuit, hamiltonian: PauliOperator) -> float:
                         qubit_idx
                     )
                     term_expval = exp_val_z_contrib
-                except AttributeError:
+                except AttributeError: # Fallback if backend.get_expectation_value_z is missing
                      raise NotImplementedError(
                         "Backend function 'get_expectation_value_z' is not yet bound or implemented. "
                         "VQE get_expval requires this for 'Z' terms."
                     )
                 except RuntimeError as e:
-                    raise RuntimeError(f"Error calculating <{pauli_char}{qubit_idx}>: {e}")
-            else:
-                raise NotImplementedError(f"Expectation value for Pauli '{pauli_char}' not supported in v0.1 get_expval. Only 'Z' is.")
-        elif not pauli_ops_list: # Should have been caught by the (if not pauli_ops_list) above
-             pass # Identity, already handled
+                    raise RuntimeError(f"Error calculating <Z{qubit_idx}>: {e}")
+            elif pauli_char == 'X':
+                try:
+                    exp_val_x_contrib = backend.get_expectation_value_x(
+                        circuit._sim_handle,
+                        circuit._get_d_state_for_backend(),
+                        circuit.num_qubits,
+                        qubit_idx
+                    )
+                    term_expval = exp_val_x_contrib
+                except AttributeError:
+                    raise NotImplementedError(
+                        "Backend function 'get_expectation_value_x' is not yet bound or implemented. "
+                        "VQE get_expval requires this for 'X' terms."
+                    )
+                except RuntimeError as e:
+                    raise RuntimeError(f"Error calculating <X{qubit_idx}>: {e}")
+            elif pauli_char == 'Y':
+                try:
+                    exp_val_y_contrib = backend.get_expectation_value_y(
+                        circuit._sim_handle,
+                        circuit._get_d_state_for_backend(),
+                        circuit.num_qubits,
+                        qubit_idx
+                    )
+                    term_expval = exp_val_y_contrib
+                except AttributeError:
+                    raise NotImplementedError(
+                        "Backend function 'get_expectation_value_y' is not yet bound or implemented. "
+                        "VQE get_expval requires this for 'Y' terms."
+                    )
+                except RuntimeError as e:
+                    raise RuntimeError(f"Error calculating <Y{qubit_idx}>: {e}")
+            else: # Should not happen due to PauliOperator parsing
+                raise NotImplementedError(f"Expectation value for Pauli '{pauli_char}' not supported in get_expval.")
+        elif not pauli_ops_list: # Identity term
+             pass # Already handled: term_expval = 1.0, total_expval += coeff * 1.0
         else:
             # Product of Paulis, e.g., Z0 Z1
             raise NotImplementedError("Expectation value for products of Paulis (e.g., 'Z0 Z1') not yet supported in v0.1 get_expval.")
