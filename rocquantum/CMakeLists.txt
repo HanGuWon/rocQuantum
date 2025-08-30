@@ -4,6 +4,8 @@ project(rocQuantum LANGUAGES CXX HIP)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(CMAKE_PREFIX_PATH "C:/Users/한구원/Desktop/ROCm-develop")
+
 # Find HIP
 find_package(HIP REQUIRED)
 if(NOT HIP_FOUND)

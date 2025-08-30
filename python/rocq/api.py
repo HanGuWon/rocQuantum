@@ -355,7 +355,8 @@ class PauliOperator:
             else:
                 op_str = " ".join([f"{p}{q}" for p, q in ops])
             term_strs.append(f"{coeff} * [{op_str}]")
-        return "PauliOperator(\n  " + "\n+ ".join(term_strs) + "\n)"
+        return "PauliOperator(
+  " + "\n+ ".join(term_strs) + "\n)"
 
     def __add__(self, other):
         if not isinstance(other, PauliOperator):
@@ -489,14 +490,14 @@ def kernel(func):
             # For now, we'll simplify and assume qubits are implicitly managed.
             # And parameters are passed to gates directly.
 
-            mlir_lines.append(f"func.func @{func.__name__}({', '.join([f'%arg{i}: !quantum.qubit' for i in range(kernel_args[0])])}) {{") # kernel_args[0] is num_qubits
+            mlir_lines.append(f"func.func @{func.__name__}({', '.join([f'%arg{i}: !quantum.qubit' for i in range(kernel_args[0])])}) {{') # kernel_args[0] is num_qubits
 
             # Very basic AST traversal for Call nodes
             for node in ast.walk(func_def):
                 if isinstance(node, ast.Call):
                     # Check if it's a method call on the first argument (e.g., circuit.h())
-                    if isinstance(node.func, ast.Attribute) and \
-                       isinstance(node.func.value, ast.Name) and \
+                    if isinstance(node.func, ast.Attribute) and 
+                       isinstance(node.func.value, ast.Name) and 
                        node.func.value.id == func_def.args.args[0].arg: # Check if it's like 'circuit.gate()'
 
                         gate_name = node.func.attr
@@ -505,7 +506,7 @@ def kernel(func):
                         if gate_name == "h" and len(gate_args) == 1 and isinstance(gate_args[0], ast.Constant):
                             qubit_idx = gate_args[0].value
                             mlir_lines.append(f"  %q{qubit_idx}_h = \"quantum.gate\"(%q{qubit_idx}) {{ gate_name = \"H\" }} : (!quantum.qubit) -> !quantum.qubit")
-                        elif gate_name == "cx" and len(gate_args) == 2 and \
+                        elif gate_name == "cx" and len(gate_args) == 2 and 
                              isinstance(gate_args[0], ast.Constant) and isinstance(gate_args[1], ast.Constant):
                             ctrl_idx = gate_args[0].value
                             target_idx = gate_args[1].value
@@ -659,7 +660,7 @@ def get_expval(program: QuantumProgram, hamiltonian: PauliOperator) -> float:
         #          if pauli_ops_list = [('Z', 1)], calculate <Z1>
         # More complex terms like "Z0 X1" are NOT YET SUPPORTED by this simplified get_expval.
 
-        term_expval = 1.0 # For products of Paulis, this would be more complex.
+        term_expval = 1.0 # For products of Paulis, this would be more complex. 
                          # For now, we assume only terms like c_i * Z_k or c_j * X_k etc.
                          # The PauliOperator structure allows for "Z0 X1", but this get_expval won't handle it yet.
 
@@ -764,5 +765,3 @@ def get_expval(program: QuantumProgram, hamiltonian: PauliOperator) -> float:
         total_expval += coeff * term_expval
 
     return total_expval
-
-```

@@ -46,8 +46,8 @@ public:
      * @return Index of the added tensor in the network.
      */
     int add_tensor(const rocquantum::util::rocTensor& tensor) {
-        tensors_.push_back(tensor); // Makes a copy of the rocTensor struct
-        return static_cast<int>(tensors_.size() - 1);
+        initial_tensors_.push_back(tensor); // Makes a copy of the rocTensor struct
+        return static_cast<int>(initial_tensors_.size() - 1);
     }
 
     /**
@@ -60,22 +60,22 @@ public:
      * @return rocqStatus_t indicating success or failure (e.g., invalid indices).
      */
     rocqStatus_t add_contraction(int tensor_idx_A, int mode_idx_A, int tensor_idx_B, int mode_idx_B) {
-        if (tensor_idx_A < 0 || tensor_idx_A >= static_cast<int>(tensors_.size()) ||
-            tensor_idx_B < 0 || tensor_idx_B >= static_cast<int>(tensors_.size()) ||
+        if (tensor_idx_A < 0 || tensor_idx_A >= static_cast<int>(initial_tensors_.size()) ||
+            tensor_idx_B < 0 || tensor_idx_B >= static_cast<int>(initial_tensors_.size()) ||
             tensor_idx_A == tensor_idx_B) { // Disallow self-contraction for this simple API
             return ROCQ_STATUS_INVALID_VALUE;
         }
-        if (mode_idx_A < 0 || mode_idx_A >= static_cast<int>(tensors_[tensor_idx_A].rank()) ||
-            mode_idx_B < 0 || mode_idx_B >= static_cast<int>(tensors_[tensor_idx_B].rank())) {
+        if (mode_idx_A < 0 || mode_idx_A >= static_cast<int>(initial_tensors_[tensor_idx_A].rank()) ||
+            mode_idx_B < 0 || mode_idx_B >= static_cast<int>(initial_tensors_[tensor_idx_B].rank())) {
             return ROCQ_STATUS_INVALID_VALUE;
         }
         // Basic check: ensure dimensions of contracted modes match
-        if (tensors_[tensor_idx_A].dimensions_[mode_idx_A] != tensors_[tensor_idx_B].dimensions_[mode_idx_B]) {
+        if (initial_tensors_[tensor_idx_A].dimensions_[mode_idx_A] != initial_tensors_[tensor_idx_B].dimensions_[mode_idx_B]) {
             return ROCQ_STATUS_INVALID_VALUE; // Dimension mismatch for contraction
         }
 
-        contractions_.push_back({{tensor_idx_A, mode_idx_A}, {tensor_idx_B, mode_idx_B}});
-        return ROCQ_STATUS_SUCCESS;
+        // This function is deprecated in favor of using labels
+        return ROCQ_STATUS_NOT_IMPLEMENTED;
     }
 
     /**
@@ -87,27 +87,8 @@ public:
      * @param blas_handle rocBLAS handle for GEMM operations.
      * @param stream HIP stream for operations.
      * @return rocqStatus_t
-     * @note This is a STUB. Actual contraction logic is not yet implemented.
      */
-    rocqStatus_t contract(rocquantum::util::rocTensor* result_tensor, rocblas_handle blas_handle, hipStream_t stream) {
-        // TODO: Implement pathfinding (e.g., greedy).
-        // TODO: Implement pairwise contraction using rocTensorContractWithRocBLAS.
-        // TODO: Manage intermediate tensors and their memory.
-        if (!result_tensor || !blas_handle) return ROCQ_STATUS_INVALID_VALUE;
-
-        // For now, just print the network structure as a placeholder
-        // std::cout << "TensorNetwork::contract() called. Network has " << tensors_.size() << " tensors." << std::endl;
-        // for(size_t i=0; i < tensors_.size(); ++i) {
-        //     std::cout << "  Tensor " << i << ": Rank " << tensors_[i].rank() << ", Elements " << tensors_[i].get_element_count() << std::endl;
-        // }
-        // std::cout << "Contractions to perform: " << contractions_.size() << std::endl;
-        // for(const auto& p : contractions_) {
-        //    std::cout << "  (" << p.first.first << "," << p.first.second << ") with ("
-        //              << p.second.first << "," << p.second.second << ")" << std::endl;
-        // }
-
-        return ROCQ_STATUS_NOT_IMPLEMENTED;
-    }
+    rocqStatus_t contract(rocquantum::util::rocTensor* result_tensor, rocblas_handle blas_handle, hipStream_t stream);
 
 
 public:
@@ -145,34 +126,7 @@ private:
      */
     std::vector<std::pair<int, int>> find_shared_mode_indices(
         const rocquantum::util::rocTensor& t1,
-        const rocquantum::util::rocTensor& t2) const {
-
-        std::vector<std::pair<int, int>> shared_indices;
-        if (t1.labels_.empty() || t2.labels_.empty()) {
-            return shared_indices; // Cannot find shared labels if not defined
-        }
-
-        for (size_t i = 0; i < t1.rank(); ++i) {
-            if (t1.labels_[i].empty()) continue; // Skip empty labels
-            for (size_t j = 0; j < t2.rank(); ++j) {
-                if (t2.labels_[j].empty()) continue;
-                if (t1.labels_[i] == t2.labels_[j]) {
-                    // Check if dimensions match for this potential contraction
-                    if (t1.dimensions_[i] == t2.dimensions_[j]) {
-                        shared_indices.push_back({static_cast<int>(i), static_cast<int>(j)});
-                    } else {
-                        // Optional: Log a warning or throw if labels match but dims don't
-                        // For now, just don't consider it a valid contraction pair
-                    }
-                    // Assuming a label is unique within a tensor for contraction purposes.
-                    // If a label can appear multiple times on *different* modes of the same tensor,
-                    // this logic would need to be more complex or such labels disallowed for simple contraction.
-                    break; // Found match for t1.labels_[i], move to next label in t1
-                }
-            }
-        }
-        return shared_indices;
-    }
+        const rocquantum::util::rocTensor& t2) const;
 
     /**
      * @brief Calculates the metadata (dimensions, labels) of a tensor resulting from contracting two tensors.
@@ -187,46 +141,7 @@ private:
         const rocquantum::util::rocTensor& t2,
         const std::vector<std::pair<int, int>>& contracted_mode_pairs,
         std::vector<long long>& out_new_dims,
-        std::vector<std::string>& out_new_labels) const {
-
-        out_new_dims.clear();
-        out_new_labels.clear();
-        std::vector<bool> t1_mode_contracted(t1.rank(), false);
-        std::vector<bool> t2_mode_contracted(t2.rank(), false);
-
-        for(const auto& p : contracted_mode_pairs) {
-            t1_mode_contracted[p.first] = true;
-            t2_mode_contracted[p.second] = true;
-        }
-
-        // Add uncontracted modes from t1
-        for (size_t i = 0; i < t1.rank(); ++i) {
-            if (!t1_mode_contracted[i]) {
-                out_new_dims.push_back(t1.dimensions_[i]);
-                if (i < t1.labels_.size() && !t1.labels_[i].empty()) {
-                    out_new_labels.push_back(t1.labels_[i]);
-                } else {
-                     // Generate a unique placeholder label if needed, or leave empty
-                    out_new_labels.push_back("uncontracted_A_" + std::to_string(i));
-                }
-            }
-        }
-        // Add uncontracted modes from t2
-        for (size_t i = 0; i < t2.rank(); ++i) {
-            if (!t2_mode_contracted[i]) {
-                out_new_dims.push_back(t2.dimensions_[i]);
-                 if (i < t2.labels_.size() && !t2.labels_[i].empty()) {
-                    out_new_labels.push_back(t2.labels_[i]);
-                } else {
-                    out_new_labels.push_back("uncontracted_B_" + std::to_string(i));
-                }
-            }
-        }
-        if (out_new_dims.empty()) { // Result is a scalar
-            out_new_dims.push_back(1); // Represent scalar as dim {1}
-            out_new_labels.push_back("scalar_result");
-        }
-    }
+        std::vector<std::string>& out_new_labels) const;
 
 
 public:
@@ -332,7 +247,7 @@ rocqStatus_t rocTensorNetworkAddTensor(rocTensorNetworkHandle_t handle, const ro
  *                           for the result tensor data.
  * @param blas_handle rocBLAS handle for GEMM operations.
  * @param stream HIP stream for operations.
- * @return rocqStatus_t Status of the operation. ROCQ_STATUS_NOT_IMPLEMENTED for now.
+ * @return rocqStatus_t Status of the operation.
  */
 rocqStatus_t rocTensorNetworkContract(rocTensorNetworkHandle_t handle,
                                       rocquantum::util::rocTensor* result_tensor,

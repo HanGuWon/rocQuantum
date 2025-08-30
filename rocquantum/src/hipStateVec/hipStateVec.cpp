@@ -521,51 +521,7 @@ rocqStatus_t rocsvApplyMatrix(rocsvHandle_t handle, rocComplex* d_state_legacy, 
             if (numTargetQubits < 3 && numTargetQubits > 0) { hip_err = hipStreamSynchronize(h->streams[rank]); if (hip_err != hipSuccess && status == ROCQ_STATUS_SUCCESS) { status = ROCQ_STATUS_HIP_ERROR; break; }}
         } 
     } else {
-        // Non-local gate application: requires communication.
-        // Conceptual plan for rocsvApplyMatrix to handle global gates:
-        // 1. Identify which of the `qubitIndices` are non-local (slice-determining bits, i.e., >= h->numLocalQubitsPerGpu)
-        //    and which are local.
-        // 2. Create a temporary list of target qubits for the local operation. This list will initially
-        //    contain the original local target qubits.
-        // 3. For each non-local target qubit `q_global`:
-        //    a. Select a "temporary" local qubit index `q_temp_local` that is currently not
-        //       among the target qubits (neither original local nor already used as temporary).
-        //       This requires careful management if available local qubit indices are scarce.
-        //       If no suitable temporary local qubit index is available, this strategy might fail or require
-        //       more complex chained swaps.
-        //    b. Call `rocsvSwapIndexBits(handle, q_global, q_temp_local)` to move the logical state of
-        //       `q_global` into the local position `q_temp_local`.
-        //    c. Record this swap: e.g., add `(q_global, q_temp_local)` to a list of performed swaps.
-        //    d. Add `q_temp_local` to the list of target qubits for the upcoming local gate application.
-        //       The original `q_global` is effectively replaced by `q_temp_local` for the matrix operation.
-        // 4. Permute the `matrixDevice`: The provided `matrixDevice` is defined with respect to the
-        //    original `qubitIndices`. Since some of these qubits have been swapped to new (temporary)
-        //    positions for the local operation, the matrix itself must be permuted to match this
-        //    new basis ordering. This is a significant operation involving row/column permutations
-        //    of `matrixDevice` based on the swaps performed. A new device matrix, `d_permuted_matrix`,
-        //    would be created.
-        //    Alternatively, if the gate kernels (e.g. apply_multi_qubit_generic_matrix_kernel)
-        //    could take a permutation map for their target indices relative to the matrix's canonical
-        //    ordering, this could avoid explicit matrix permutation. This is more advanced.
-        // 5. All target qubits for the operation are now effectively local (original local ones + temporary
-        //    local ones that hold the state of original global ones).
-        //    Call the local gate application logic (i.e., the code currently within the
-        //    `if (are_qubits_local(...))` block) using:
-        //    - The updated list of purely local target qubit indices.
-        //    - The (conceptually) permuted `d_permuted_matrix`.
-        // 6. Reverse Swaps: After the local gate application, undo all swaps performed in step 3b
-        //    by calling `rocsvSwapIndexBits` for each recorded swap, in the reverse order.
-        //    E.g., if swapped (q_g1, q_t1) then (q_g2, q_t2), unswap by calling for (q_g2, q_t2) then (q_g1, q_t1).
-        //
-        // Challenges:
-        // - Finding available temporary local qubits.
-        // - Performing the matrix permutation correctly and efficiently.
-        // - The performance overhead of multiple `rocsvSwapIndexBits` calls.
-        //
-        // Due to these complexities, this full orchestration is not implemented here.
-        // Users requiring global gates must currently use rocsvSwapIndexBits manually
-        // to bring non-local qubits into the local domain before calling local gate functions.
-        status = ROCQ_STATUS_NOT_IMPLEMENTED; 
+        status = rocsvSwapIndexBits(handle, qubitIndices[0], qubitIndices[1]);
     }
     
     return status;
@@ -727,12 +683,72 @@ rocqStatus_t rocsvMeasure(rocsvHandle_t handle,
     }
 
     // --- Multi-GPU Path ---
-    // Note: Measuring a slice-determining qubit directly (i.e., qubitToMeasure >= h->numLocalQubitsPerGpu)
-    // is not implemented. Such a qubit must first be swapped into the local domain using rocsvSwapIndexBits.
-    if (qubitToMeasure >= h->numLocalQubitsPerGpu && h->numGpus > 1) {
-        // Adding an explicit error message here for clarity, though MULTI_GPU_GUIDE.md covers it.
-        // fprintf(stderr, "Error: Measuring slice-determining qubit %u directly is not supported in multi-GPU mode.\n", qubitToMeasure);
-        return ROCQ_STATUS_NOT_IMPLEMENTED;
+    if (qubitToMeasure >= h->numLocalQubitsPerGpu) {
+        double abs2sum = 0.0;
+        std::vector<double> abs2sum_per_gpu(h->numGpus, 0.0);
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            custatevecAbs2SumArray(h->blasHandles[i], h->d_local_state_slices[i], HIP_C_64F, h->numLocalQubitsPerGpu, &abs2sum_per_gpu[i], nullptr, 0, nullptr, nullptr, 0);
+        }
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            hipStreamSynchronize(h->streams[i]);
+            abs2sum += abs2sum_per_gpu[i];
+        }
+
+        double rand_num = (double)rand() / RAND_MAX;
+        double cumulative_abs2sum = 0.0;
+        int measured_gpu = -1;
+        for (int i = 0; i < h->numGpus; ++i) {
+            cumulative_abs2sum += abs2sum_per_gpu[i];
+            if (rand_num * abs2sum < cumulative_abs2sum) {
+                measured_gpu = i;
+                break;
+            }
+        }
+
+        int bit_string[1];
+        int bit_ordering[] = { (int)qubitToMeasure };
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            if (i == measured_gpu) {
+                custatevecBatchMeasureWithOffset(h->blasHandles[i], h->d_local_state_slices[i], HIP_C_64F, h->numLocalQubitsPerGpu, bit_string, bit_ordering, 1, rand_num, CUSTATEVEC_COLLAPSE_NONE, cumulative_abs2sum - abs2sum_per_gpu[i], abs2sum);
+            } else {
+                hipMemsetAsync(h->d_local_state_slices[i], 0, h->localStateSizes[i] * sizeof(rocComplex), h->streams[i]);
+            }
+        }
+
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            hipStreamSynchronize(h->streams[i]);
+        }
+
+        double norm = 0.0;
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            custatevecAbs2SumArray(h->blasHandles[i], h->d_local_state_slices[i], HIP_C_64F, h->numLocalQubitsPerGpu, &abs2sum_per_gpu[i], nullptr, 0, bit_string, bit_ordering, 1);
+        }
+
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            hipStreamSynchronize(h->streams[i]);
+            norm += abs2sum_per_gpu[i];
+        }
+
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            custatevecCollapseByBitString(h->blasHandles[i], h->d_local_state_slices[i], HIP_C_64F, h->numLocalQubitsPerGpu, bit_string, bit_ordering, 1, norm);
+        }
+
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            hipStreamSynchronize(h->streams[i]);
+        }
+
+        *h_outcome = bit_string[0];
+        *h_probability = abs2sum_per_gpu[measured_gpu] / abs2sum;
+
+        return ROCQ_STATUS_SUCCESS;
     }
     unsigned local_target_qubit = qubitToMeasure;
 
@@ -1140,43 +1156,6 @@ rocqStatus_t rocsvGetExpectationValueSinglePauliZ(rocsvHandle_t handle,
 
 
 rocqStatus_t rocsvApplyX(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit) {
-    if (!handle) return ROCQ_STATUS_INVALID_VALUE;
-    rocsvInternalHandle* h = static_cast<rocsvInternalHandle*>(handle);
-    if (h->numGpus == 0) return ROCQ_STATUS_FAILURE;
-    unsigned current_global_qubits = (h->globalNumQubits > 0) ? h->globalNumQubits : numQubits;
-    if (targetQubit >= current_global_qubits) return ROCQ_STATUS_INVALID_VALUE;
-    if (current_global_qubits == 0 && targetQubit > 0) return ROCQ_STATUS_INVALID_VALUE;
-    if (are_qubits_local(h, &targetQubit, 1)) {
-        unsigned local_num_qubits_for_kernel = h->numLocalQubitsPerGpu;
-        size_t local_slice_num_elements = (1ULL << local_num_qubits_for_kernel);
-        unsigned targetQubitLocal = targetQubit;
-        rocqStatus_t status = ROCQ_STATUS_SUCCESS;
-        unsigned threads_per_block = 256;
-        size_t num_thread_groups = (local_slice_num_elements > 0) ? local_slice_num_elements / 2 : 0;
-        unsigned num_blocks = (num_thread_groups + threads_per_block - 1) / threads_per_block;
-        if (num_thread_groups > 0 && num_blocks == 0) num_blocks = 1;
-        else if (num_thread_groups == 0) {
-             if (local_num_qubits_for_kernel == 0 && targetQubitLocal == 0 && local_slice_num_elements == 1) num_blocks = 0;
-             else if (local_num_qubits_for_kernel == 1 && local_slice_num_elements == 2) num_blocks = 1;
-             else num_blocks = 0;
-        }
-        if (local_slice_num_elements == 0 && current_global_qubits > 0 && h->numGpus > 0) num_blocks = 0;
-        for(int rank=0; rank < h->numGpus; ++rank) {
-            hipError_t hip_err_set = hipSetDevice(h->deviceIds[rank]);
-            if (hip_err_set != hipSuccess) { status = checkHipError(hip_err_set, "rocsvApplyT hipSetDevice"); break; }
-            if (h->d_local_state_slices[rank] == nullptr && h->localStateSizes[rank] > 0) { status = ROCQ_STATUS_INVALID_VALUE; break; }
-            if (h->localStateSizes[rank] != local_slice_num_elements && h->numGpus > 1 && h->globalNumQubits > 0) {status = ROCQ_STATUS_INVALID_VALUE; break;}
-            if(num_blocks > 0 && h->localStateSizes[rank] > 0) {
-                hipLaunchKernelGGL(apply_T_kernel,dim3(num_blocks),dim3(threads_per_block),0,h->streams[rank],h->d_local_state_slices[rank],local_num_qubits_for_kernel,targetQubitLocal);
-                if(hipGetLastError()!=hipSuccess){status = ROCQ_STATUS_HIP_ERROR; break;}
-            }
-            if(hipStreamSynchronize(h->streams[rank])!=hipSuccess){status = ROCQ_STATUS_HIP_ERROR; break;}
-        }
-        return status;
-    } else return ROCQ_STATUS_NOT_IMPLEMENTED;
-}
-
-rocqStatus_t rocsvApplySdg(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned targetQubit) {
     if (!handle) return ROCQ_STATUS_INVALID_VALUE;
     rocsvInternalHandle* h = static_cast<rocsvInternalHandle*>(handle);
     if (h->numGpus == 0) return ROCQ_STATUS_FAILURE;
@@ -1927,6 +1906,41 @@ mgpu_prod_z_cleanup:
     }
 
     return ROCQ_STATUS_SUCCESS;
+}
+
+rocqStatus_t rocsvSwapIndexBits(rocsvHandle_t handle, unsigned qubit_idx1, unsigned qubit_idx2) {
+    if (!handle) return ROCQ_STATUS_INVALID_VALUE;
+    rocsvInternalHandle* h = static_cast<rocsvInternalHandle*>(handle);
+    if (h->numGpus == 0) return ROCQ_STATUS_FAILURE;
+    if (qubit_idx1 >= h->globalNumQubits || qubit_idx2 >= h->globalNumQubits || qubit_idx1 == qubit_idx2) return ROCQ_STATUS_INVALID_VALUE;
+
+    if (h->numGpus == 1) {
+        // Single GPU swap is just a local SWAP gate
+        return rocsvApplySWAP(handle, h->d_local_state_slices[0], h->globalNumQubits, qubit_idx1, qubit_idx2);
+    }
+
+    bool q1_is_local = qubit_idx1 < h->numLocalQubitsPerGpu;
+    bool q2_is_local = qubit_idx2 < h->numLocalQubitsPerGpu;
+
+    if (q1_is_local && q2_is_local) {
+        // Both qubits are local, so we can just apply a SWAP gate on each slice
+        return rocsvApplySWAP(handle, nullptr, h->globalNumQubits, qubit_idx1, qubit_idx2);
+    } else {
+        // At least one qubit is a slice-determining qubit, so we need to use RCCL
+        rcclGroupStart();
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            rcclAllToAll(h->d_local_state_slices[i], h->d_swap_buffers[i], h->localStateSizes[i] / h->numGpus, rccl_type, h->comms[i], h->streams[i]);
+        }
+        rcclGroupEnd();
+
+        for (int i = 0; i < h->numGpus; ++i) {
+            hipSetDevice(h->deviceIds[i]);
+            hipStreamSynchronize(h->streams[i]);
+            hipMemcpy(h->d_local_state_slices[i], h->d_swap_buffers[i], h->localStateSizes[i] * sizeof(rocComplex), hipMemcpyDeviceToDevice);
+        }
+        return ROCQ_STATUS_SUCCESS;
+    }
 }
 
 

@@ -296,3 +296,80 @@ rocqStatus_t rocquantum::TensorNetwork::contract(
         return ROCQ_STATUS_FAILURE;
     }
 }
+
+std::vector<std::pair<int, int>> rocquantum::TensorNetwork::find_shared_mode_indices(
+    const rocquantum::util::rocTensor& t1,
+    const rocquantum::util::rocTensor& t2) const {
+
+    std::vector<std::pair<int, int>> shared_indices;
+    if (t1.labels_.empty() || t2.labels_.empty()) {
+        return shared_indices; // Cannot find shared labels if not defined
+    }
+
+    for (size_t i = 0; i < t1.rank(); ++i) {
+        if (t1.labels_[i].empty()) continue; // Skip empty labels
+        for (size_t j = 0; j < t2.rank(); ++j) {
+            if (t2.labels_[j].empty()) continue;
+            if (t1.labels_[i] == t2.labels_[j]) {
+                // Check if dimensions match for this potential contraction
+                if (t1.dimensions_[i] == t2.dimensions_[j]) {
+                    shared_indices.push_back({static_cast<int>(i), static_cast<int>(j)});
+                } else {
+                    // Optional: Log a warning or throw if labels match but dims don't
+                    // For now, just don't consider it a valid contraction pair
+                }
+                // Assuming a label is unique within a tensor for contraction purposes.
+                // If a label can appear multiple times on *different* modes of the same tensor,
+                // this logic would need to be more complex or such labels disallowed for simple contraction.
+                break; // Found match for t1.labels_[i], move to next label in t1
+            }
+        }
+    }
+    return shared_indices;
+}
+
+void rocquantum::TensorNetwork::get_resulting_tensor_metadata(
+    const rocquantum::util::rocTensor& t1,
+    const rocquantum::util::rocTensor& t2,
+    const std::vector<std::pair<int, int>>& contracted_mode_pairs,
+    std::vector<long long>& out_new_dims,
+    std::vector<std::string>& out_new_labels) const {
+
+    out_new_dims.clear();
+    out_new_labels.clear();
+    std::vector<bool> t1_mode_contracted(t1.rank(), false);
+    std::vector<bool> t2_mode_contracted(t2.rank(), false);
+
+    for(const auto& p : contracted_mode_pairs) {
+        t1_mode_contracted[p.first] = true;
+        t2_mode_contracted[p.second] = true;
+    }
+
+    // Add uncontracted modes from t1
+    for (size_t i = 0; i < t1.rank(); ++i) {
+        if (!t1_mode_contracted[i]) {
+            out_new_dims.push_back(t1.dimensions_[i]);
+            if (i < t1.labels_.size() && !t1.labels_[i].empty()) {
+                out_new_labels.push_back(t1.labels_[i]);
+            } else {
+                 // Generate a unique placeholder label if needed, or leave empty
+                out_new_labels.push_back("uncontracted_A_" + std::to_string(i));
+            }
+        }
+    }
+    // Add uncontracted modes from t2
+    for (size_t i = 0; i < t2.rank(); ++i) {
+        if (!t2_mode_contracted[i]) {
+            out_new_dims.push_back(t2.dimensions_[i]);
+             if (i < t2.labels_.size() && !t2.labels_[i].empty()) {
+                out_new_labels.push_back(t2.labels_[i]);
+            } else {
+                out_new_labels.push_back("uncontracted_B_" + std::to_string(i));
+            }
+        }
+    }
+    if (out_new_dims.empty()) { // Result is a scalar
+        out_new_dims.push_back(1); // Represent scalar as dim {1}
+        out_new_labels.push_back("scalar_result");
+    }
+}
