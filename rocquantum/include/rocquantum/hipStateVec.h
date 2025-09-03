@@ -353,6 +353,101 @@ rocqStatus_t rocsvGetExpectationValuePauliProductZ(rocsvHandle_t handle,
                                                    double* result);
 
 
+/**
+ * @brief Calculates the expectation value of a generic Pauli string (e.g., "IXYZ").
+ * <psi|P_q0 P_q1 ... P_qn|psi> where P is I, X, Y, or Z.
+ * Note: This function is non-destructive and restores the state vector after calculation.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @param[in] d_state Pointer to the device state vector.
+ * @param[in] numQubits Total number of qubits.
+ * @param[in] pauliString A null-terminated string representing the Pauli product (e.g., "IXYZ").
+ * @param[in] targetQubits Array of global qubit indices the Pauli operators act upon.
+ * @param[in] numTargetPaulis Number of operators in the product (must match strlen(pauliString)).
+ * @param[out] result Pointer to store the expectation value.
+ * @return rocqStatus_t Status.
+ */
+rocqStatus_t rocsvGetExpectationPauliString(rocsvHandle_t handle,
+                                            rocComplex* d_state,
+                                            unsigned numQubits,
+                                            const char* pauliString,
+                                            const unsigned* targetQubits,
+                                            unsigned numTargetPaulis,
+                                            double* result);
+
+
+/**
+ * @brief Samples from the state vector in the computational basis.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @param[in] d_state Pointer to the device state vector.
+ * @param[in] numQubits Total number of qubits.
+ * @param[in] measuredQubits Array of qubit indices to be measured.
+ * @param[in] numMeasuredQubits The number of qubits to measure.
+ * @param[in] numShots The number of measurement shots to perform.
+ * @param[out] h_results Host pointer to an array to store the measurement outcomes (bitstrings).
+ *                     The array must be large enough to hold numShots results (numShots * sizeof(uint64_t)).
+ * @return rocqStatus_t Status.
+ */
+rocqStatus_t rocsvSample(rocsvHandle_t handle,
+                         rocComplex* d_state,
+                         unsigned numQubits,
+                         const unsigned* measuredQubits,
+                         unsigned numMeasuredQubits,
+                         unsigned numShots,
+                         uint64_t* h_results);
+
+
+/**
+ * @brief Applies a general matrix to target qubits, controlled by multiple control qubits.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @param[in] d_state Pointer to the device state vector.
+ * @param[in] numQubits Total number of qubits.
+ * @param[in] controlQubits Array of control qubit indices.
+ * @param[in] numControls Number of control qubits.
+ * @param[in] targetQubits Array of target qubit indices.
+ * @param[in] numTargets Number of target qubits.
+ * @param[in] d_matrix Device pointer to the matrix to be applied (column-major).
+ * @return rocqStatus_t Status.
+ */
+rocqStatus_t rocsvApplyControlledMatrix(rocsvHandle_t handle,
+                                        rocComplex* d_state,
+                                        unsigned numQubits,
+                                        const unsigned* controlQubits,
+                                        unsigned numControls,
+                                        const unsigned* targetQubits,
+                                        unsigned numTargets,
+                                        const rocComplex* d_matrix);
+
+/**
+ * @brief Applies a matrix to target qubits and immediately measures a single qubit,
+ *        collapsing the state vector.
+ *
+ * This fused operation can improve performance by avoiding separate kernel launches.
+ * The state vector is modified in place.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @param[in] d_state Pointer to the device state vector.
+ * @param[in] numQubits Total number of qubits in the state vector.
+ * @param[in] targetQubits Array of qubit indices the gate acts upon.
+ * @param[in] numTargetQubits Number of target qubits.
+ * @param[in] d_matrix Device pointer to the gate matrix (column-major).
+ * @param[in] qubitToMeasure The index of the qubit to measure after applying the gate.
+ * @param[out] outcome Pointer to store the measurement outcome (0 or 1).
+ * @return rocqStatus_t Status of the operation.
+ */
+rocqStatus_t rocsvApplyMatrixAndMeasure(rocsvHandle_t handle,
+                                        rocComplex* d_state,
+                                        unsigned numQubits,
+                                        const unsigned* targetQubits,
+                                        unsigned numTargetQubits,
+                                        const rocComplex* d_matrix,
+                                        unsigned qubitToMeasure,
+                                        int* outcome);
+
+
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

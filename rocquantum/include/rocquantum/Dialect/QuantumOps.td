@@ -59,10 +59,14 @@ def GenericGateOp : Quantum_Op<"gate", [AttrSizedOperandSegments]> {
     The specific unitary matrix corresponding to the gate name is defined
     by the backend or a gate library.
     This op can represent single-qubit or multi-qubit gates.
+    An 'is_adjoint' attribute can be set to true to apply the adjoint of the gate.
   }];
 
   let arguments = (ins StrAttr:$gate_name, Variadic<QubitType>:$qubits);
   // For parameterized gates, add: Variadic<F64Type>:$params
+
+  // Add an optional boolean attribute to the op itself.
+  let optionalAttributes = (ins BoolAttr:$is_adjoint);
 
   // Results could be the same qubits if ops are defined to return their inputs,
   // or void if gates are purely side-effecting on the state vector.
@@ -90,6 +94,34 @@ def MeasureOp : Quantum_Op<"measure"> {
 
 
   let assemblyFormat = "$qubit attr-dict `->` type($result)";
+}
+
+def IfOp : Quantum_Op<"if", [SingleBlockImplicitTerminator<"YieldOp">, NoSideEffect]> {
+    let summary = "Conditional execution operation";
+    let description = [{
+        The `if` operation represents an if-then style conditional. It has a
+        single region for the 'then' body. The operation takes a condition value,
+        which must be a 1-bit integer (i1). If the condition is true (1),
+        the 'then' region is executed. There is no 'else' body.
+    }];
+
+    let arguments = (ins I1Type:$condition);
+
+    let regions = (region SizedRegion<1>:$thenRegion);
+
+    let assemblyFormat = "$condition `{` $thenRegion `}` attr-dict";
+}
+
+def YieldOp : Quantum_Op<"yield", [Terminator]> {
+    let summary = "Yield operation for quantum dialect regions";
+    let description = [{
+        `quantum.yield` is a special terminator operation for blocks inside other
+        quantum operations. For example, it terminates the block within a
+        `quantum.if` operation.
+    }];
+
+    let arguments = (ins);
+    let assemblyFormat = "attr-dict";
 }
 
 #endif // ROCQUANTUM_QUANTUM_OPS_TD
