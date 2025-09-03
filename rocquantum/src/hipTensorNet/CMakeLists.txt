@@ -18,7 +18,7 @@ add_library(rocqsim_tensornet STATIC
 # The rocquantum root include directory should provide rocquantum/*.h
 # The hipTensorNet include directory is the current one (if headers were placed here, but they are in root include)
 target_include_directories(rocqsim_tensornet PUBLIC
-    $<INSTALL_getRootRuntimeDependenciesസ്റ്റ്rocquantum_DIR}/include> # For rocquantum/*.h
+    
     ${HIP_INCLUDE_DIRS}
     ${rocblas_INCLUDE_DIRS}
 )

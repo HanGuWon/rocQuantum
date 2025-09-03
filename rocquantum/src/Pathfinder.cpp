@@ -147,6 +147,9 @@ internal::ContractionPlan Pathfinder::findOptimalPath(
     const TensorNetwork<T>& network,
     const hipTensorNetContractionOptimizerConfig_t& config)
 {
+    internal::ContractionPlan plan;
+    plan.initial_tensors = network.getInitialTensors();
+
     // Delegate to the appropriate private method based on the selected algorithm.
     switch (config.pathfinder_algorithm) {
         case ROCTN_PATHFINDER_ALGO_GREEDY:

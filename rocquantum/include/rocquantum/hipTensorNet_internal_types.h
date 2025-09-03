@@ -2,6 +2,7 @@
 #define HIP_TENSOR_NET_INTERNAL_TYPES_H
 
 #include "hipTensorNet_api.h" // For rocPathfinderAlgorithm_t
+#include "rocTensorUtil.h" // For rocTensor
 #include <vector>
 #include <string>
 
@@ -33,6 +34,9 @@ struct ContractionStep {
 struct ContractionPlan {
     ///< The ordered sequence of pairwise contraction steps.
     std::vector<ContractionStep> steps;
+
+    ///< A copy of the initial tensors in the network.
+    std::vector<rocquantum::util::rocTensor> initial_tensors;
 
     ///< The total estimated floating-point operations for the entire contraction.
     long long total_flops = 0;

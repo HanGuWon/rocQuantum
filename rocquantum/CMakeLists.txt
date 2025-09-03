@@ -4,7 +4,12 @@ project(rocQuantum LANGUAGES CXX HIP)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(CMAKE_PREFIX_PATH "C:/Users/한구원/Desktop/ROCm-develop")
+if(DEFINED ENV{ROCM_PATH})
+    set(CMAKE_PREFIX_PATH "$ENV{ROCM_PATH}")
+    message(STATUS "Using ROCM_PATH from environment: ${CMAKE_PREFIX_PATH}")
+else()
+    message(FATAL_ERROR "ROCM_PATH environment variable not set. Please set it to your ROCm installation path.")
+endif()
 
 # Find HIP
 find_package(HIP REQUIRED)
