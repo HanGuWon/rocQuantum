@@ -383,68 +383,48 @@ SliceIndexInfo selectSliceIndex(
     const internal::ContractionPlan& plan,
     int slicing_step_index)
 {
+    // Ensure the slicing_step_index is valid.
+    if (slicing_step_index < 0 || slicing_step_index >= plan.steps.size()) {
+        throw std::out_of_range("Slicing step index is out of bounds.");
+    }
+
+    // Retrieve the specific contraction step that violates the memory limit.
     const auto& step = plan.steps.at(slicing_step_index);
 
-    // Reconstruct the state of active tensors just before the slicing step
-    std::map<int, util::rocTensor> active_tensors;
-    for (size_t i = 0; i < plan.initial_tensors.size(); ++i) {
-        active_tensors[i] = plan.initial_tensors[i];
+    // The candidates for slicing are the non-contracted ("free") indices of the
+    // resulting intermediate tensor from this step. Their details are stored
+    // directly in the ContractionStep.
+    const auto& resulting_labels = step.resulting_labels;
+    const auto& resulting_dims = step.resulting_dims;
+
+    if (resulting_labels.empty()) {
+        // This case occurs if the contraction results in a scalar, which has no indices to slice.
+        throw std::runtime_error("No suitable index found for slicing because the contraction results in a scalar.");
     }
 
-    for (int i = 0; i < slicing_step_index; ++i) {
-        const auto& prev_step = plan.steps[i];
-        util::rocTensor new_tensor;
-        // Simplified reconstruction. We only need dims and labels.
-        new_tensor.dims_ = prev_step.resulting_dims;
-        new_tensor.labels_ = prev_step.resulting_labels;
-        new_tensor.data_ = nullptr;
-        new_tensor.owned_ = false;
-        
-        int new_tensor_id = plan.initial_tensors.size() + i;
-        active_tensors[new_tensor_id] = new_tensor;
-        active_tensors.erase(prev_step.tensor_index_1);
-        active_tensors.erase(prev_step.tensor_index_2);
-    }
-
-    const auto& tensor1 = active_tensors.at(step.tensor_index_1);
-    const auto& tensor2 = active_tensors.at(step.tensor_index_2);
-
-    // Identify non-contracted indices (slice candidates)
-    std::set<std::string> contracted_labels;
-    for(const auto& mode : step.contraction_modes) {
-        contracted_labels.insert(mode.label);
-    }
-
-    std::map<std::string, long long> slice_candidates;
-    for (size_t i = 0; i < tensor1.labels_.size(); ++i) {
-        if (contracted_labels.find(tensor1.labels_[i]) == contracted_labels.end()) {
-            slice_candidates[tensor1.labels_[i]] = tensor1.dims_[i];
-        }
-    }
-    for (size_t i = 0; i < tensor2.labels_.size(); ++i) {
-        if (contracted_labels.find(tensor2.labels_[i]) == contracted_labels.end()) {
-            // If a label is in both tensors but not contracted, it's an outer product.
-            // We can still slice over it.
-            slice_candidates[tensor2.labels_[i]] = tensor2.dims_[i];
-        }
-    }
-
-    if (slice_candidates.empty()) {
-        throw std::runtime_error("No suitable index found for slicing. The contraction results in a scalar.");
-    }
-
-    // Heuristic: choose the index with the largest dimension to slice over.
-    std::string best_label;
+    // Heuristic: Find the index (label) corresponding to the largest dimension.
+    // Slicing along the largest dimension typically provides the most significant
+    // reduction in the size of the tensors being processed in each partial contraction.
     long long max_dim = 0;
-    for (const auto& candidate : slice_candidates) {
-        if (candidate.second > max_dim) {
-            max_dim = candidate.second;
-            best_label = candidate.first;
+    int best_label_idx = -1;
+
+    for (size_t i = 0; i < resulting_dims.size(); ++i) {
+        if (resulting_dims[i] > max_dim) {
+            max_dim = resulting_dims[i];
+            best_label_idx = i;
         }
     }
 
+    if (best_label_idx == -1) {
+        // This is a fallback, in case all dimensions are 0 or 1.
+        // We can just pick the first index.
+        best_label_idx = 0;
+        max_dim = resulting_dims[0];
+    }
+
+    // Populate the return struct with the chosen label and its dimension.
     SliceIndexInfo slice_info;
-    slice_info.slice_label = best_label;
+    slice_info.slice_label = resulting_labels[best_label_idx];
     slice_info.slice_dimension = max_dim;
 
     return slice_info;
@@ -459,10 +439,8 @@ util::rocTensor executeSlicedContraction(
     rocblas_handle blas_handle,
     util::WorkspaceManager* workspace)
 {
-    // 1. Reconstruct active tensors up to the slicing point
+    // 1. Reconstruct active tensors up to the slicing point by executing previous steps.
     std::map<int, util::rocTensor> active_tensors;
-    // A map to keep track of intermediate tensors created before the slicing step,
-    // which need to be freed later.
     std::map<int, util::rocTensor> intermediates_to_free;
 
     for (size_t i = 0; i < plan.initial_tensors.size(); ++i) {
@@ -475,7 +453,6 @@ util::rocTensor executeSlicedContraction(
         auto& tensor_b = active_tensors.at(step.tensor_index_2);
         
         util::rocTensor intermediate_tensor;
-        // Here we perform the actual contractions for steps before the slicing point.
         rocTensorContractWithRocBLAS<T>(tensor_a, tensor_b, step.contraction_modes, &intermediate_tensor, blas_handle, workspace);
 
         int new_tensor_id = plan.initial_tensors.size() + i;
@@ -486,12 +463,12 @@ util::rocTensor executeSlicedContraction(
         active_tensors.erase(step.tensor_index_2);
     }
 
-    // 2. Prepare for the sliced contraction
+    // 2. Prepare for the sliced contraction.
     const auto& slicing_step = plan.steps[slicing_info.slicing_step_index];
     auto& tensor1 = active_tensors.at(slicing_info.tensor1_index);
     auto& tensor2 = active_tensors.at(slicing_info.tensor2_index);
 
-    // Create the full result tensor for this step and allocate memory, initialized to zero.
+    // Allocate the full result tensor for this step on the GPU and initialize to zero.
     util::rocTensor full_result_tensor;
     full_result_tensor.labels_ = slicing_step.resulting_labels;
     full_result_tensor.dims_ = slicing_step.resulting_dims;
@@ -500,30 +477,30 @@ util::rocTensor executeSlicedContraction(
     hipMemset(full_result_tensor.data_, 0, full_result_tensor.num_elements_ * sizeof(T));
     full_result_tensor.owned_ = true;
 
-    // 3. Main Slicing Loop
+    // 3. Main Slicing Loop: Iterate over the largest dimension.
     for (long long i = 0; i < slice_index_info.slice_dimension; ++i) {
-        // Create views for the current slice. These are metadata-only, no data is copied.
+        // Create metadata-only views for the current slice of each tensor.
         util::TensorView<T> view1 = util::create_sliced_view<T>(tensor1, slice_index_info.slice_label, i);
         util::TensorView<T> view2 = util::create_sliced_view<T>(tensor2, slice_index_info.slice_label, i);
 
-        // The views need to be converted to temporary rocTensor objects for the contraction function.
+        // Convert views to temporary rocTensor objects to pass to the contraction function.
         util::rocTensor tensor_slice1 = view1.to_rocTensor();
         util::rocTensor tensor_slice2 = view2.to_rocTensor();
 
         util::rocTensor partial_result;
         rocTensorContractWithRocBLAS<T>(tensor_slice1, tensor_slice2, slicing_step.contraction_modes, &partial_result, blas_handle, workspace);
 
-        // Accumulate the partial result into the full result tensor using the custom HIP kernel.
+        // Use the custom HIP kernel to accumulate the partial result into the correct slice of the full tensor.
         launch_accumulate_sliced_result<T>(full_result_tensor, partial_result, slice_index_info.slice_label, i, hipStreamDefault);
         
-        // Free the memory used by the partial result.
+        // Free the device memory allocated for the partial result.
         util::rocTensorFree(&partial_result);
     }
 
-    // 4. Continue with the rest of the contraction plan
+    // 4. Continue with the rest of the contraction plan.
     int sliced_result_id = plan.initial_tensors.size() + slicing_info.slicing_step_index;
     active_tensors[sliced_result_id] = full_result_tensor;
-    intermediates_to_free[sliced_result_id] = full_result_tensor; // Mark for cleanup
+    intermediates_to_free[sliced_result_id] = full_result_tensor;
     active_tensors.erase(slicing_info.tensor1_index);
     active_tensors.erase(slicing_info.tensor2_index);
 
@@ -543,15 +520,13 @@ util::rocTensor executeSlicedContraction(
     }
 
     if (active_tensors.size() != 1) {
-        // Cleanup memory before throwing
         for(auto const& [key, val] : intermediates_to_free) util::rocTensorFree(&val);
         throw std::runtime_error("Sliced contraction did not result in a single final tensor.");
     }
 
     util::rocTensor final_tensor = active_tensors.begin()->second;
     
-    // Cleanup all intermediate tensors created during this function's scope,
-    // except for the final one that we are returning.
+    // Clean up all intermediate tensors except for the final result.
     intermediates_to_free.erase(active_tensors.begin()->first);
     for(auto const& [key, val] : intermediates_to_free) {
         util::rocTensorFree(&val);
