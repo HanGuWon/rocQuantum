@@ -67,3 +67,21 @@ target_include_directories(rocqsim_tensornet PUBLIC
 
 # Add an alias if we want to link with a simpler name like roc::rocqsim_tensornet
 # add_library(roc::rocqsim_tensornet ALIAS rocqsim_tensornet) # Optional
+
+# --- Unit Tests ---
+# Enable testing if it's not enabled at a higher level
+if(NOT CMAKE_PROJECT_NAME STREQUAL "rocQuantumTests")
+    enable_testing()
+endif()
+
+# Add the test executable for rocTensorUtil
+add_executable(test_rocTensorUtil test_hipTensorNet_rocTensorUtil.cpp)
+target_link_libraries(test_rocTensorUtil PRIVATE rocqsim_tensornet)
+
+# Add the new test executable for slicing
+add_executable(test_slicing test_hipTensorNet_slicing.cpp)
+target_link_libraries(test_slicing PRIVATE rocqsim_tensornet)
+
+# Add tests to CTest
+add_test(NAME RocTensorUtilTest COMMAND test_rocTensorUtil)
+add_test(NAME SlicingLogicTest COMMAND test_slicing)

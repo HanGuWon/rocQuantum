@@ -439,9 +439,14 @@ util::rocTensor executeSlicedContraction(
     rocblas_handle blas_handle,
     util::WorkspaceManager* workspace)
 {
-    // 1. Reconstruct active tensors up to the slicing point by executing previous steps.
+    // This function orchestrates the sliced contraction.
+    // 1. It computes intermediate tensors up to the slicing point.
+    // 2. It iterates over the specified axis, performs partial contractions for each slice, and accumulates the result.
+    // 3. It forms a new network with the result of the sliced contraction and the remaining tensors to complete the calculation.
+
+    // --- Step 1: Execute the plan up to the slicing point ---
     std::map<int, util::rocTensor> active_tensors;
-    std::map<int, util::rocTensor> intermediates_to_free;
+    std::map<int, util::rocTensor> intermediates_to_free; // Track intermediate tensors for memory cleanup
 
     for (size_t i = 0; i < plan.initial_tensors.size(); ++i) {
         active_tensors[i] = plan.initial_tensors[i];
@@ -463,73 +468,84 @@ util::rocTensor executeSlicedContraction(
         active_tensors.erase(step.tensor_index_2);
     }
 
-    // 2. Prepare for the sliced contraction.
+    // --- Step 2: Perform the sliced contraction ---
     const auto& slicing_step = plan.steps[slicing_info.slicing_step_index];
     auto& tensor1 = active_tensors.at(slicing_info.tensor1_index);
     auto& tensor2 = active_tensors.at(slicing_info.tensor2_index);
 
-    // Allocate the full result tensor for this step on the GPU and initialize to zero.
-    util::rocTensor full_result_tensor;
-    full_result_tensor.labels_ = slicing_step.resulting_labels;
-    full_result_tensor.dims_ = slicing_step.resulting_dims;
-    full_result_tensor.num_elements_ = std::accumulate(full_result_tensor.dims_.begin(), full_result_tensor.dims_.end(), 1LL, std::multiplies<long long>());
-    hipMalloc(&full_result_tensor.data_, full_result_tensor.num_elements_ * sizeof(T));
-    hipMemset(full_result_tensor.data_, 0, full_result_tensor.num_elements_ * sizeof(T));
-    full_result_tensor.owned_ = true;
+    // Allocate the full result tensor for the sliced step on the GPU and initialize to zero.
+    util::rocTensor sliced_step_result;
+    sliced_step_result.labels_ = slicing_step.resulting_labels;
+    sliced_step_result.dims_ = slicing_step.resulting_dims;
+    sliced_step_result.num_elements_ = std::accumulate(sliced_step_result.dims_.begin(), sliced_step_result.dims_.end(), 1LL, std::multiplies<long long>());
+    hipMalloc(&sliced_step_result.data_, sliced_step_result.num_elements_ * sizeof(T));
+    hipMemset(sliced_step_result.data_, 0, sliced_step_result.num_elements_ * sizeof(T));
+    sliced_step_result.owned_ = true;
 
-    // 3. Main Slicing Loop: Iterate over the largest dimension.
+    // Main slicing loop: iterate over the specified dimension.
     for (long long i = 0; i < slice_index_info.slice_dimension; ++i) {
-        // Create metadata-only views for the current slice of each tensor.
-        util::TensorView<T> view1 = util::create_sliced_view<T>(tensor1, slice_index_info.slice_label, i);
-        util::TensorView<T> view2 = util::create_sliced_view<T>(tensor2, slice_index_info.slice_label, i);
+        // Use the create_sliced_view utility to create a lightweight view for the current slice.
+        // Check which tensor to slice via its label.
+        util::rocTensor tensor_slice1 = tensor1;
+        util::rocTensor tensor_slice2 = tensor2;
+        
+        auto it1 = std::find(tensor1.labels_.begin(), tensor1.labels_.end(), slice_index_info.slice_label);
+        if (it1 != tensor1.labels_.end()) {
+            util::TensorView<T> view = util::create_sliced_view<T>(tensor1, slice_index_info.slice_label, i);
+            tensor_slice1 = view.to_rocTensor();
+        } else {
+            auto it2 = std::find(tensor2.labels_.begin(), tensor2.labels_.end(), slice_index_info.slice_label);
+            if (it2 != tensor2.labels_.end()) {
+                util::TensorView<T> view = util::create_sliced_view<T>(tensor2, slice_index_info.slice_label, i);
+                tensor_slice2 = view.to_rocTensor();
+            }
+        }
 
-        // Convert views to temporary rocTensor objects to pass to the contraction function.
-        util::rocTensor tensor_slice1 = view1.to_rocTensor();
-        util::rocTensor tensor_slice2 = view2.to_rocTensor();
-
+        // Calculate the partial result.
         util::rocTensor partial_result;
         rocTensorContractWithRocBLAS<T>(tensor_slice1, tensor_slice2, slicing_step.contraction_modes, &partial_result, blas_handle, workspace);
 
         // Use the custom HIP kernel to accumulate the partial result into the correct slice of the full tensor.
-        launch_accumulate_sliced_result<T>(full_result_tensor, partial_result, slice_index_info.slice_label, i, hipStreamDefault);
+        launch_accumulate_sliced_result<T>(sliced_step_result, partial_result, slice_index_info.slice_label, i, hipStreamDefault);
         
         // Free the device memory allocated for the partial result.
         util::rocTensorFree(&partial_result);
     }
 
-    // 4. Continue with the rest of the contraction plan.
-    int sliced_result_id = plan.initial_tensors.size() + slicing_info.slicing_step_index;
-    active_tensors[sliced_result_id] = full_result_tensor;
-    intermediates_to_free[sliced_result_id] = full_result_tensor;
+    // --- Step 3: Execute the rest of the plan ---
+    // Form a new TensorNetwork with the result of the sliced step and the remaining active tensors.
     active_tensors.erase(slicing_info.tensor1_index);
     active_tensors.erase(slicing_info.tensor2_index);
-
-    for (size_t i = slicing_info.slicing_step_index + 1; i < plan.steps.size(); ++i) {
-        const auto& next_step = plan.steps[i];
-        auto& tensor_a = active_tensors.at(next_step.tensor_index_1);
-        auto& tensor_b = active_tensors.at(next_step.tensor_index_2);
-        
-        util::rocTensor contracted_tensor;
-        rocTensorContractWithRocBLAS<T>(tensor_a, tensor_b, next_step.contraction_modes, &contracted_tensor, blas_handle, workspace);
-        
-        int new_tensor_id = plan.initial_tensors.size() + i;
-        active_tensors[new_tensor_id] = contracted_tensor;
-        intermediates_to_free[new_tensor_id] = contracted_tensor;
-        active_tensors.erase(next_step.tensor_index_1);
-        active_tensors.erase(next_step.tensor_index_2);
-    }
-
-    if (active_tensors.size() != 1) {
-        for(auto const& [key, val] : intermediates_to_free) util::rocTensorFree(&val);
-        throw std::runtime_error("Sliced contraction did not result in a single final tensor.");
-    }
-
-    util::rocTensor final_tensor = active_tensors.begin()->second;
     
-    // Clean up all intermediate tensors except for the final result.
-    intermediates_to_free.erase(active_tensors.begin()->first);
+    // If there are no more steps to perform, the sliced result is the final result.
+    if (slicing_info.slicing_step_index >= plan.steps.size() - 1) {
+        for(auto const& [key, val] : intermediates_to_free) {
+            util::rocTensorFree(&val);
+        }
+        return sliced_step_result;
+    }
+
+    TensorNetwork<T> remaining_tn(workspace, hipStreamDefault);
+    remaining_tn.add_tensor(sliced_step_result);
+    for (const auto& pair : active_tensors) {
+        remaining_tn.add_tensor(pair.second);
+    }
+
+    // Recursively call the contract function to compute the rest of the network.
+    util::rocTensor final_tensor;
+    hipTensorNetContractionOptimizerConfig_t remaining_config = config;
+    remaining_config.memory_limit_bytes = 0; // Prevent further slicing in subsequent calls.
+
+    rocqStatus_t status = remaining_tn.contract(&remaining_config, &final_tensor, blas_handle, hipStreamDefault);
+
+    // Clean up all intermediate tensors created in this function's scope.
+    util::rocTensorFree(&sliced_step_result);
     for(auto const& [key, val] : intermediates_to_free) {
         util::rocTensorFree(&val);
+    }
+
+    if (status != ROCQ_STATUS_SUCCESS) {
+        throw std::runtime_error("Contraction of the remaining network after slicing failed.");
     }
 
     return final_tensor;
