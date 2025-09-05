@@ -74,10 +74,11 @@ include_directories(
 
 add_subdirectory(src/hipStateVec)
 add_subdirectory(src/hipTensorNet) # Add hipTensorNet component
+add_subdirectory(src/hipDensityMat) # Add hipDensityMat component
 
 # Example for tests (can be expanded later)
-# enable_testing()
-# add_subdirectory(tests/hipStateVec) # If you add tests later
+enable_testing()
+add_subdirectory(tests/hipDensityMat) # If you add tests later
 
 message(STATUS "rocQuantum project configured. HIP compiler: ${CMAKE_HIP_COMPILER}")
 

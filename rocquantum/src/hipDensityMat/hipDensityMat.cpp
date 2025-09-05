@@ -508,6 +508,145 @@ hipDensityMatStatus_t hipDensityMatComputeExpectation(
     return HIPDENSITYMAT_STATUS_SUCCESS;
 }
 
+/**
+ * @brief GPU kernel to compute partial sums for Tr((Z_i Z_j...)ρ).
+ */
+__global__ void pauli_z_product_expectation_kernel(
+    const hipComplex* rho,
+    double* partial_sums,
+    int num_qubits,
+    int num_z_qubits,
+    const int* z_qubit_indices)
+{
+    extern __shared__ double sdata[];
+
+    const int64_t dim = 1LL << num_qubits;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block_size = blockDim.x;
+    const int64_t i_start = blockIdx.x * block_size + tid;
+    const int64_t stride = gridDim.x * block_size;
+
+    double thread_sum = 0.0;
+
+    for (int64_t i = i_start; i < dim; i += stride) {
+        int parity = 0;
+        for (int k = 0; k < num_z_qubits; ++k) {
+            if ((i >> z_qubit_indices[k]) & 1) {
+                parity++;
+            }
+        }
+        double sign = (parity % 2 == 0) ? 1.0 : -1.0;
+        thread_sum += sign * rho[i * dim + i].x;
+    }
+
+    sdata[tid] = thread_sum;
+    __syncthreads();
+
+    for (unsigned int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial_sums[blockIdx.x] = sdata[0];
+    }
+}
+
+hipDensityMatStatus_t hipDensityMatComputePauliZProductExpectation(
+    hipDensityMatState_t state,
+    int num_z_qubits,
+    const int* z_qubit_indices_host,
+    double* result_host)
+{
+    if (state == nullptr || result_host == nullptr || (num_z_qubits > 0 && z_qubit_indices_host == nullptr)) {
+        return HIPDENSITYMAT_STATUS_INVALID_VALUE;
+    }
+
+    hipDensityMatState* internal_state = static_cast<hipDensityMatState*>(state);
+    for (int i = 0; i < num_z_qubits; ++i) {
+        if (z_qubit_indices_host[i] < 0 || z_qubit_indices_host[i] >= internal_state->num_qubits_) {
+            return HIPDENSITYMAT_STATUS_INVALID_VALUE;
+        }
+    }
+
+    // Handle the identity case (no Z operators)
+    if (num_z_qubits == 0) {
+        *result_host = 1.0; // Trace of a density matrix is 1
+        return HIPDENSITYMAT_STATUS_SUCCESS;
+    }
+
+    const int64_t dim = 1LL << internal_state->num_qubits_;
+    hipError_t hip_err;
+
+    int* z_qubit_indices_device = nullptr;
+    size_t indices_size = num_z_qubits * sizeof(int);
+    hip_err = hipMalloc(&z_qubit_indices_device, indices_size);
+    if (hip_err != hipSuccess) return HIPDENSITYMAT_STATUS_ALLOC_FAILED;
+    hip_err = hipMemcpy(z_qubit_indices_device, z_qubit_indices_host, indices_size, hipMemcpyHostToDevice);
+    if (hip_err != hipSuccess) {
+        hipFree(z_qubit_indices_device);
+        return HIPDENSITYMAT_STATUS_EXECUTION_FAILED;
+    }
+
+    const int block_size = 256;
+    const int num_blocks = std::min((int)((dim + block_size - 1) / block_size), 2048);
+    
+    double* partial_sums_device = nullptr;
+    size_t partial_sums_size = num_blocks * sizeof(double);
+    hip_err = hipMalloc(&partial_sums_device, partial_sums_size);
+    if (hip_err != hipSuccess) {
+        hipFree(z_qubit_indices_device);
+        return HIPDENSITYMAT_STATUS_ALLOC_FAILED;
+    }
+
+    hipLaunchKernelGGL(pauli_z_product_expectation_kernel,
+        num_blocks,
+        block_size,
+        block_size * sizeof(double),
+        internal_state->stream_,
+        static_cast<const hipComplex*>(internal_state->device_data_),
+        partial_sums_device,
+        internal_state->num_qubits_,
+        num_z_qubits,
+        z_qubit_indices_device);
+
+    hip_err = hipGetLastError();
+    if (hip_err != hipSuccess) {
+        hipFree(z_qubit_indices_device);
+        hipFree(partial_sums_device);
+        return HIPDENSITYMAT_STATUS_EXECUTION_FAILED;
+    }
+
+    hip_err = hipStreamSynchronize(internal_state->stream_);
+    if (hip_err != hipSuccess) {
+        hipFree(z_qubit_indices_device);
+        hipFree(partial_sums_device);
+        return HIPDENSITYMAT_STATUS_EXECUTION_FAILED;
+    }
+
+    std::vector<double> partial_sums_host(num_blocks);
+    hip_err = hipMemcpy(partial_sums_host.data(), partial_sums_device, partial_sums_size, hipMemcpyDeviceToHost);
+    if (hip_err != hipSuccess) {
+        hipFree(z_qubit_indices_device);
+        hipFree(partial_sums_device);
+        return HIPDENSITYMAT_STATUS_EXECUTION_FAILED;
+    }
+
+    double total_sum = 0.0;
+    for (int i = 0; i < num_blocks; ++i) {
+        total_sum += partial_sums_host[i];
+    }
+    
+    *result_host = total_sum;
+
+    hipFree(z_qubit_indices_device);
+    hipFree(partial_sums_device);
+
+    return HIPDENSITYMAT_STATUS_SUCCESS;
+}
+
 hipDensityMatStatus_t hipDensityMatApplyAmplitudeDampingChannel(
     hipDensityMatState_t state,
     int target_qubit,
@@ -615,6 +754,229 @@ hipDensityMatStatus_t hipDensityMatApplyGate(
     if (hip_err == hipSuccess) hip_err = hipMemcpy(internal_state->device_data_, rho_out_device, size_bytes, hipMemcpyDeviceToDevice);
     
     hipFree(gate_matrix_device);
+    hipFree(rho_out_device);
+    return check_hip_error(hip_err);
+}
+
+/**
+ * @brief GPU kernel to apply a CNOT gate: ρ' = UρU†.
+ */
+__global__ void apply_cnot_kernel(
+    hipComplex* rho_out,
+    const hipComplex* rho_in,
+    int num_qubits,
+    int control_qubit,
+    int target_qubit)
+{
+    const int64_t dim = 1LL << num_qubits;
+    const int64_t row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row >= dim || col >= dim) return;
+
+    const int64_t control_mask = 1LL << control_qubit;
+    const int64_t target_mask = 1LL << target_qubit;
+
+    // Source indices are calculated by applying the CNOT transformation
+    // to the destination indices (row, col), since CNOT is its own inverse.
+    int64_t source_row = row;
+    if ((row & control_mask) != 0) {
+        source_row ^= target_mask;
+    }
+
+    int64_t source_col = col;
+    if ((col & control_mask) != 0) {
+        source_col ^= target_mask;
+    }
+
+    rho_out[row * dim + col] = rho_in[source_row * dim + source_col];
+}
+
+hipDensityMatStatus_t hipDensityMatApplyCNOT(
+    hipDensityMatState_t state,
+    int control_qubit,
+    int target_qubit)
+{
+    if (state == nullptr) return HIPDENSITYMAT_STATUS_INVALID_VALUE;
+    
+    hipDensityMatState* internal_state = static_cast<hipDensityMatState*>(state);
+    if (control_qubit < 0 || control_qubit >= internal_state->num_qubits_ ||
+        target_qubit < 0 || target_qubit >= internal_state->num_qubits_ ||
+        control_qubit == target_qubit) {
+        return HIPDENSITYMAT_STATUS_INVALID_VALUE;
+    }
+
+    const int64_t dim = 1LL << internal_state->num_qubits_;
+    const size_t size_bytes = internal_state->num_elements_ * sizeof(hipComplex);
+    
+    hipComplex* rho_out_device = nullptr;
+    hipError_t hip_err;
+
+    hip_err = hipMalloc(&rho_out_device, size_bytes);
+    if (hip_err != hipSuccess) {
+        return HIPDENSITYMAT_STATUS_ALLOC_FAILED;
+    }
+
+    dim3 blockDim(16, 16);
+    dim3 gridDim((dim + blockDim.x - 1) / blockDim.x, (dim + blockDim.y - 1) / blockDim.y);
+    hipLaunchKernelGGL(apply_cnot_kernel, gridDim, blockDim, 0, internal_state->stream_,
+        rho_out_device, static_cast<const hipComplex*>(internal_state->device_data_),
+        internal_state->num_qubits_, control_qubit, target_qubit);
+
+    hip_err = hipGetLastError();
+    if (hip_err == hipSuccess) hip_err = hipStreamSynchronize(internal_state->stream_);
+    if (hip_err == hipSuccess) hip_err = hipMemcpy(internal_state->device_data_, rho_out_device, size_bytes, hipMemcpyDeviceToDevice);
+    
+    hipFree(rho_out_device);
+    return check_hip_error(hip_err);
+}
+
+/**
+ * @brief GPU kernel to apply a generic controlled single-qubit gate: ρ' = UρU†.
+ */
+__global__ void apply_controlled_gate_kernel(
+    hipComplex* rho_out,
+    const hipComplex* rho_in,
+    const hipComplex* U, // 2x2 gate matrix for target qubit
+    int num_qubits,
+    int control_qubit,
+    int target_qubit)
+{
+    const int64_t dim = 1LL << num_qubits;
+    const int64_t row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row >= dim || col >= dim) return;
+
+    const int64_t control_mask = 1LL << control_qubit;
+    const bool is_control_in_row = ((row & control_mask) != 0);
+    const bool is_control_in_col = ((col & control_mask) != 0);
+
+    const int64_t target_low_mask = (1LL << target_qubit) - 1;
+    const int64_t target_high_mask = ~((1LL << (target_qubit + 1)) - 1);
+
+    const int64_t row_low = row & target_low_mask;
+    const int64_t row_high = row & target_high_mask;
+    const int row_t = (row >> target_qubit) & 1;
+
+    const int64_t col_low = col & target_low_mask;
+    const int64_t col_high = col & target_high_mask;
+    const int col_t = (col >> target_qubit) & 1;
+
+    hipComplex result = make_hipFloatComplex(0.0f, 0.0f);
+
+    for (int kt = 0; kt < 2; ++kt) {
+        for (int lt = 0; lt < 2; ++lt) {
+            const int64_t k_base = (row_high & ~control_mask) | (kt << target_qubit) | row_low;
+            const int64_t l_base = (col_high & ~control_mask) | (lt << target_qubit) | col_low;
+
+            hipComplex term = make_hipFloatComplex(0.0f, 0.0f);
+
+            // Term 1: Control bit is 0 for both k and l
+            int64_t k0 = k_base;
+            int64_t l0 = l_base;
+            hipComplex rho_kl0 = rho_in[k0 * dim + l0];
+            if (row_t == kt && col_t == lt) { // Identity applied
+                term = hipCaddf(term, rho_kl0);
+            }
+
+            // Term 2: Control bit is 1 for both k and l
+            int64_t k1 = k_base | control_mask;
+            int64_t l1 = l_base | control_mask;
+            hipComplex rho_kl1 = rho_in[k1 * dim + l1];
+            hipComplex U_rowt_kt = U[row_t * 2 + kt];
+            hipComplex U_colt_lt_conj = hipConjf(U[col_t * 2 + lt]);
+            hipComplex u_rho_u = hipCmulf(U_rowt_kt, rho_kl1);
+            u_rho_u = hipCmulf(u_rho_u, U_colt_lt_conj);
+            term = hipCaddf(term, u_rho_u);
+            
+            // This simplified logic is only correct if control qubit is not target qubit
+            // and row/col high/low masks don't overlap with control bit, which is true.
+            // The full transformation involves 4 terms from U_full = |0><0|⊗I + |1><1|⊗U_target
+            // but cross-terms like <0|ρ|1> are zero if control bit is separated.
+            // Here we assume the control qubit state is not mixed with target operations.
+            // A more general kernel would handle all 4 blocks of the full density matrix.
+            // This implementation correctly handles cases where the control qubit subspace is diagonal.
+            if (is_control_in_row == is_control_in_col) {
+                 if (is_control_in_row) { // Control is 1
+                    hipComplex U_rowt_kt = U[row_t * 2 + kt];
+                    hipComplex U_colt_lt_conj = hipConjf(U[col_t * 2 + lt]);
+                    int64_t k = k_base | control_mask;
+                    int64_t l = l_base | control_mask;
+                    hipComplex u_rho_u = hipCmulf(U_rowt_kt, rho_in[k * dim + l]);
+                    u_rho_u = hipCmulf(u_rho_u, U_colt_lt_conj);
+                    result = hipCaddf(result, u_rho_u);
+                 } else { // Control is 0
+                    if (row_t == kt && col_t == lt) {
+                        int64_t k = k_base;
+                        int64_t l = l_base;
+                        result = hipCaddf(result, rho_in[k * dim + l]);
+                    }
+                 }
+            } else { // Off-diagonal blocks related to the control qubit
+                // U_full = |0><0|I + |1><1|U_target
+                // For <0|ρ'|1>, the term is I * <0|ρ|1> * U_target^dagger
+                // For <1|ρ'|0>, the term is U_target * <1|ρ|0> * I
+                if (is_control_in_row) { // <1|ρ'|0> block
+                    hipComplex U_rowt_kt = U[row_t * 2 + kt];
+                    int64_t k = k_base | control_mask; // k has control bit 1
+                    int64_t l = l_base;               // l has control bit 0
+                    if (col_t == lt) { // I_colt_lt is delta
+                        hipComplex u_rho = hipCmulf(U_rowt_kt, rho_in[k * dim + l]);
+                        result = hipCaddf(result, u_rho);
+                    }
+                } else { // <0|ρ'|1> block
+                    hipComplex U_colt_lt_conj = hipConjf(U[col_t * 2 + lt]);
+                    int64_t k = k_base;               // k has control bit 0
+                    int64_t l = l_base | control_mask; // l has control bit 1
+                    if (row_t == kt) { // I_rowt_kt is delta
+                        hipComplex rho_u_dag = hipCmulf(rho_in[k * dim + l], U_colt_lt_conj);
+                        result = hipCaddf(result, rho_u_dag);
+                    }
+                }
+            }
+        }
+    }
+     rho_out[row * dim + col] = result;
+}
+
+
+hipDensityMatStatus_t hipDensityMatApplyControlledGate(
+    hipDensityMatState_t state,
+    int control_qubit,
+    int target_qubit,
+    const hipComplex* gate_matrix_device)
+{
+    if (state == nullptr || gate_matrix_device == nullptr) return HIPDENSITYMAT_STATUS_INVALID_VALUE;
+    
+    hipDensityMatState* internal_state = static_cast<hipDensityMatState*>(state);
+    if (control_qubit < 0 || control_qubit >= internal_state->num_qubits_ ||
+        target_qubit < 0 || target_qubit >= internal_state->num_qubits_ ||
+        control_qubit == target_qubit) {
+        return HIPDENSITYMAT_STATUS_INVALID_VALUE;
+    }
+
+    const int64_t dim = 1LL << internal_state->num_qubits_;
+    const size_t size_bytes = internal_state->num_elements_ * sizeof(hipComplex);
+    
+    hipComplex* rho_out_device = nullptr;
+    hipError_t hip_err;
+
+    hip_err = hipMalloc(&rho_out_device, size_bytes);
+    if (hip_err != hipSuccess) {
+        return HIPDENSITYMAT_STATUS_ALLOC_FAILED;
+    }
+
+    dim3 blockDim(16, 16);
+    dim3 gridDim((dim + blockDim.x - 1) / blockDim.x, (dim + blockDim.y - 1) / blockDim.y);
+    hipLaunchKernelGGL(apply_controlled_gate_kernel, gridDim, blockDim, 0, internal_state->stream_,
+        rho_out_device, static_cast<const hipComplex*>(internal_state->device_data_),
+        gate_matrix_device, internal_state->num_qubits_, control_qubit, target_qubit);
+
+    hip_err = hipGetLastError();
+    if (hip_err == hipSuccess) hip_err = hipStreamSynchronize(internal_state->stream_);
+    if (hip_err == hipSuccess) hip_err = hipMemcpy(internal_state->device_data_, rho_out_device, size_bytes, hipMemcpyDeviceToDevice);
+    
     hipFree(rho_out_device);
     return check_hip_error(hip_err);
 }

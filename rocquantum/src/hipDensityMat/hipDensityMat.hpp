@@ -132,6 +132,23 @@ hipDensityMatStatus_t hipDensityMatComputeExpectation(
     double* result_host);
 
 /**
+ * @brief Computes the expectation value of a multi-qubit Pauli Z product observable.
+ *
+ * Calculates <Z_i Z_j ...> = Tr((Z_i ⊗ Z_j ⊗ ...)ρ) for a given set of qubits.
+ *
+ * @param[in] state The state handle.
+ * @param[in] num_z_qubits The number of qubits in the Pauli Z product.
+ * @param[in] z_qubit_indices Array of qubit indices to apply the Z operator to.
+ * @param[out] result_host Pointer to a double on the host to store the result.
+ * @return hipDensityMatStatus_t Status of the operation.
+ */
+hipDensityMatStatus_t hipDensityMatComputePauliZProductExpectation(
+    hipDensityMatState_t state,
+    int num_z_qubits,
+    const int* z_qubit_indices,
+    double* result_host);
+
+/**
  * @brief Applies a single-qubit Amplitude Damping noise channel.
  *
  * This channel models energy dissipation, e.g., a |1> state decaying to |0>.
@@ -160,6 +177,41 @@ hipDensityMatStatus_t hipDensityMatApplyGate(
     hipDensityMatState_t state,
     int target_qubit,
     const hipComplex* gate_matrix_host);
+
+
+
+/**
+ * @brief Applies an ideal (noiseless) CNOT gate to the density matrix.
+ *
+ * The operation is ρ' = UρU†, where U is the CNOT gate matrix.
+ *
+ * @param[in] state The state handle.
+ * @param[in] control_qubit The index of the control qubit.
+ * @param[in] target_qubit The index of the target qubit.
+ * @return hipDensityMatStatus_t Status of the operation.
+ */
+hipDensityMatStatus_t hipDensityMatApplyCNOT(
+    hipDensityMatState_t state,
+    int control_qubit,
+    int target_qubit);
+
+/**
+ * @brief Applies a generic controlled single-qubit gate to the density matrix.
+ *
+ * The operation is ρ' = UρU†, where U is the controlled-gate matrix.
+ * The single-qubit gate is applied to the target qubit if the control qubit is in state |1>.
+ *
+ * @param[in] state The state handle.
+ * @param[in] control_qubit The index of the control qubit.
+ * @param[in] target_qubit The index of the target qubit.
+ * @param[in] gate_matrix_device Pointer to a 2x2 unitary hipComplex matrix on the device.
+ * @return hipDensityMatStatus_t Status of the operation.
+ */
+hipDensityMatStatus_t hipDensityMatApplyControlledGate(
+    hipDensityMatState_t state,
+    int control_qubit,
+    int target_qubit,
+    const hipComplex* gate_matrix_device);
 
 
 
