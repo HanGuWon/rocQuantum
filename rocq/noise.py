@@ -11,6 +11,13 @@ class NoiseModel:
     Attributes:
         _channels (list): A private list storing the configuration of each
             added noise channel.
+
+    Usage Example:
+        >>> noise_model = rocq.NoiseModel()
+        >>> # Add a 1% depolarizing channel after any gate on qubits 0 and 1.
+        >>> noise_model.add_channel('depolarizing', 0.01, on_qubits=[0, 1])
+        >>> # Add a 0.5% bit-flip channel specifically after CNOT gates.
+        >>> noise_model.add_channel('bit_flip', 0.005, after_op='cnot')
     """
 
     def __init__(self):

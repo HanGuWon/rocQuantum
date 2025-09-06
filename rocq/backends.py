@@ -127,6 +127,15 @@ def get_backend(backend_name, num_qubits):
 
     Raises:
         ValueError: If the requested `backend_name` is not supported.
+
+    Usage Example:
+        >>> from rocq.backends import get_backend
+        >>>
+        >>> # Get a state vector simulator for 10 qubits
+        >>> sv_simulator = get_backend('state_vector', 10)
+        >>>
+        >>> # Get a density matrix simulator for 5 qubits
+        >>> dm_simulator = get_backend('density_matrix', 5)
     """
     SUPPORTED_BACKENDS = ['state_vector', 'density_matrix']
     if backend_name not in SUPPORTED_BACKENDS:
