@@ -1,90 +1,55 @@
-# rocQuantum
-A quantum simulation library for AMD's ROCm, a counterpart to NVIDIA's CuQuantum.
+# rocQuantum-1
 
-## Features
-- High-performance quantum state vector simulation (`hipStateVec`).
-- Multi-GPU support for distributed simulation on a single node.
-- Tensor network contraction (`hipTensorNet`).
-- C++ API for integration into existing workflows.
-- Python API (`rocq`) for ease of use.
+A high-performance, CUDA Quantum-like quantum computing simulation framework for AMD GPUs. rocQuantum-1 provides a high-level, user-centric programming model built on top of a powerful C++/HIP backend, designed for modern quantum algorithm development.
 
-## Building
+## Core Features
 
-### Dependencies
-- ROCm
-- rocBLAS
-- RCCL
+*   **Modern, kernel-based programming model:** Define reusable, parameterized quantum circuits with the intuitive `@rocq.kernel` decorator.
+*   **High-performance C++/HIP backends:** Leverage the full power of AMD GPUs for accelerated simulation.
+*   **State-vector simulation:** For ideal, noise-free quantum systems.
+*   **Density-matrix simulation:** For realistic simulations featuring a high-level noise model (`rocq.NoiseModel`).
+*   **Foundation for operator algebra:** Easily define Hamiltonians and other observables using `rocq.PauliOperator` for expectation value calculations.
 
-### Instructions
+## Installation
 
-```
-mkdir build
-cd build
-cmake ..
-make
-```
+(Installation instructions will be provided here in the future.)
 
-## Usage
+## Quick Start
 
-### Tensor Network Contraction
+The following example demonstrates the primary workflow for defining a quantum kernel, specifying a Hamiltonian, and calculating its expectation value.
 
 ```python
 import rocq
-import numpy as np
 
-# Create a simulator
-sim = rocq.Simulator()
+# 1. Define a parameterized kernel to prepare a quantum state.
+@rocq.kernel
+def prepare_ghz_state(theta: float):
+    """Prepares a generalized GHZ state."""
+    q = rocq.qvec(3)
+    rocq.h(q[0])
+    rocq.cnot(q[0], q[1])
+    rocq.ry(theta, q[2])
+    rocq.cnot(q[1], q[2])
 
-# Create a tensor network
-tn = rocq.TensorNetwork(simulator=sim)
+# 2. Define a Hamiltonian (e.g., H = 0.5*X0*Z1 + 0.3*Z0*Y2)
+hamiltonian = 0.5 * rocq.PauliOperator("X0 Z1") + 0.3 * rocq.PauliOperator("Z0 Y2")
 
-# Create tensors
-tensor_a = np.random.rand(2, 2).astype(np.complex64)
-tensor_b = np.random.rand(2, 2).astype(np.complex64)
+# 3. Execute the kernel and compute the expectation value of the Hamiltonian.
+# The C++ backend is mocked, so this will return a placeholder value.
+exp_val = rocq.get_expectation_value(
+    prepare_ghz_state,
+    hamiltonian,
+    backend='state_vector',
+    theta=1.57  # Provide a concrete value for the 'theta' parameter
+)
 
-# Add tensors to the network
-tn.add_tensor(tensor_a, ["a", "b"])
-tn.add_tensor(tensor_b, ["b", "c"])
-
-# Contract the network
-result = tn.contract()
-
-# Print the result
-print(result)
+print(f"Computed Expectation Value: {exp_val}")
 ```
 
-### Multi-GPU State Vector Simulation
+## Running Tests
 
-```python
-import rocq
-import numpy as np
+To verify the installation and the integrity of the framework, run the test suite from the project's root directory:
 
-# Create a simulator
-sim = rocq.Simulator()
-
-# Create a multi-GPU circuit
-circuit = rocq.Circuit(num_qubits=3, simulator=sim, multi_gpu=True)
-
-# Apply some gates
-circuit.h(0)
-circuit.cx(0, 1)
-
-# Swap qubit 0 and 2
-circuit.swap(0, 2)
-
-# Measure qubit 0
-outcome, prob = circuit.measure(0)
-
-# Print the result
-print(f"Measured outcome: {outcome} with probability {prob}")
-```
-
-## Running the Examples
-
-To run the examples, first build the `rocQuantum` library. Then, you can run the example scripts from the `examples` directory:
-
-```
-cd examples
-python tensornet_example.py
-python multi_gpu_swap_example.py
+```shell
+python -m unittest tests/test_framework.py
 ```
