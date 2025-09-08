@@ -12,6 +12,7 @@ add_library(rocqsim_tensornet STATIC
     rocTensorUtil.cpp
     hipTensorNet.cpp
     rocTensorUtil_kernels.hip # Ensure kernels are compiled
+    PermutationKernels.hip # Add the new permutation kernel
 )
 
 # Include directories
@@ -33,10 +34,11 @@ target_link_libraries(rocqsim_tensornet PUBLIC
 # Check if hipcc is the compiler, necessary for .hip files
 if(CMAKE_CXX_COMPILER_ID STREQUAL "HIP" OR CMAKE_HIP_COMPILER_ID) # Check if HIP compiler is in use
     set_source_files_properties(rocTensorUtil_kernels.hip PROPERTIES LANGUAGE HIP)
-    message(STATUS "rocTensorUtil_kernels.hip will be compiled with HIP compiler.")
+    set_source_files_properties(PermutationKernels.hip PROPERTIES LANGUAGE HIP) # Set language for new kernel
+    message(STATUS "rocTensorUtil_kernels.hip and PermutationKernels.hip will be compiled with HIP compiler.")
 else()
     # This case should ideally not happen if project is configured for HIP
-    message(WARNING "rocTensorUtil_kernels.hip might not be compiled correctly as HIP compiler is not detected as CXX compiler.")
+    message(WARNING "rocTensorUtil_kernels.hip and PermutationKernels.hip might not be compiled correctly as HIP compiler is not detected as CXX compiler.")
 endif()
 
 # Installation rules (optional for now, can be added later)
@@ -82,6 +84,12 @@ target_link_libraries(test_rocTensorUtil PRIVATE rocqsim_tensornet)
 add_executable(test_slicing test_hipTensorNet_slicing.cpp)
 target_link_libraries(test_slicing PRIVATE rocqsim_tensornet)
 
+# Add the new test executable for the permutation kernel
+add_executable(test_permutation ../../tests/hipTensorNet/test_PermutationKernels.cpp)
+target_link_libraries(test_permutation PRIVATE rocqsim_tensornet)
+
+
 # Add tests to CTest
 add_test(NAME RocTensorUtilTest COMMAND test_rocTensorUtil)
 add_test(NAME SlicingLogicTest COMMAND test_slicing)
+add_test(NAME PermutationKernelTest COMMAND test_permutation)

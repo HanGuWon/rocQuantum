@@ -78,7 +78,8 @@ rocqStatus_t rocTensorContractWithRocBLAS(
     const std::vector<std::pair<int, int>>& mode_pairs,
     util::rocTensor* result_tensor,
     rocblas_handle blas_handle,
-    util::WorkspaceManager* workspace) {
+    util::WorkspaceManager* workspace,
+    hipStream_t stream) {
 
     // Step 1: Determine the dimensions and labels for the permutation.
     // The goal is to reshape tensor_a and tensor_b into 2D matrices for GEMM.
@@ -115,22 +116,38 @@ rocqStatus_t rocTensorContractWithRocBLAS(
         }
     }
     
-    // Step 2: Allocate workspace for permuted tensors (matrices A' and B')
+    // NEW Step 2: Define the permutation maps for GEMM reshaping.
+    // The goal is to permute tensor_a to shape (M, K) and tensor_b to shape (K, N).
+    std::vector<int> perm_map_a;
+    perm_map_a.insert(perm_map_a.end(), a_uncontracted_indices.begin(), a_uncontracted_indices.end());
+    perm_map_a.insert(perm_map_a.end(), a_contracted_indices.begin(), a_contracted_indices.end());
+
+    std::vector<int> perm_map_b;
+    perm_map_b.insert(perm_map_b.end(), b_contracted_indices.begin(), b_contracted_indices.end());
+    perm_map_b.insert(perm_map_b.end(), b_uncontracted_indices.begin(), b_uncontracted_indices.end());
+
+    // Step 3: Allocate workspace for permuted tensors (matrices A' and B')
     T* a_permuted_data = workspace->allocate<T>(M * K);
     T* b_permuted_data = workspace->allocate<T>(K * N);
     T* c_result_data = workspace->allocate<T>(M * N);
 
-    // Step 3: Perform permutation.
-    // This is a complex operation. A real implementation would have a dedicated HIP kernel for this.
-    // Here, we conceptualize this as a call to a utility function.
-    // util::permute_tensor(tensor_a, a_uncontracted_indices, a_contracted_indices, a_permuted_data);
-    // util::permute_tensor(tensor_b, b_contracted_indices, b_uncontracted_indices, b_permuted_data);
-    // For this implementation, we'll assume data is already correctly ordered and just copy it.
-    hipMemcpy(a_permuted_data, tensor_a.data_, M * K * sizeof(T), hipMemcpyDeviceToDevice);
-    hipMemcpy(b_permuted_data, tensor_b.data_, K * N * sizeof(T), hipMemcpyDeviceToDevice);
+    // Step 4: Perform permutation using the new HIP kernel.
+    launch_permute_tensor<T>(
+        a_permuted_data,
+        static_cast<const T*>(tensor_a.data_),
+        tensor_a.dims_,
+        perm_map_a,
+        stream
+    );
+    launch_permute_tensor<T>(
+        b_permuted_data,
+        static_cast<const T*>(tensor_b.data_),
+        tensor_b.dims_,
+        perm_map_b,
+        stream
+    );
 
-
-    // Step 4: Execute GEMM using rocBLAS.
+    // Step 5: Execute GEMM using rocBLAS.
     // We need to map the template type T to a rocblas_datatype.
     rocblas_datatype compute_type = (sizeof(T) == sizeof(rocComplex)) ? rocblas_datatype_f32_c : rocblas_datatype_f64_c;
     
@@ -153,7 +170,7 @@ rocqStatus_t rocTensorContractWithRocBLAS(
         return ROCQ_STATUS_EXECUTION_FAILED;
     }
 
-    // Step 5: Create the final result tensor.
+    // Step 6: Create the final result tensor.
     // Allocate memory for the final tensor on the GPU.
     result_tensor->num_elements_ = M * N;
     hipMalloc(&result_tensor->data_, result_tensor->num_elements_ * sizeof(T));
@@ -268,7 +285,7 @@ rocqStatus_t TensorNetwork<T>::contract(const hipTensorNetContractionOptimizerCo
 
         util::rocTensor contracted_tensor;
         rocqStatus_t status = rocTensorContractWithRocBLAS<T>(
-            tensor_a, tensor_b, mode_pairs, &contracted_tensor, blas_handle, workspace_);
+            tensor_a, tensor_b, mode_pairs, &contracted_tensor, blas_handle, workspace_, stream);
 
         if (status != ROCQ_STATUS_SUCCESS) return status;
 
