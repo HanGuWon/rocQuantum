@@ -1,69 +1,74 @@
 import numpy as np
+import os
+import sys
 
-# This script assumes that the `rocquantum_bind` module has been compiled
-# and is available in the Python path.
-# You might need to run this from the `build` directory after compiling.
+# Add build directory to path to find the compiled module
+build_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'build'))
+sys.path.insert(0, build_path)
+
 try:
     import rocquantum_bind
 except ImportError:
-    print("Error: Could not import rocquantum_bind.")
-    print("Please ensure the module is compiled and you are running this script from the correct directory (e.g., the build directory).")
-    exit()
+    print(f"Error: Could not import rocquantum_bind from '{build_path}'.")
+    print("Please ensure the module is compiled.")
+    sys.exit(1)
 
-def test_simulator_bindings():
+def test_bell_state_simulation():
     """
-    Directly tests the C++ QuantumSimulator via the pybind11 bridge.
+    Tests the C++ simulator by creating a Bell state and checking the final state vector.
     """
-    num_qubits = 3
-    shots = 100
+    num_qubits = 2
     expected_sv_size = 2**num_qubits
 
-    print(f"--- Testing rocquantum_bind with {num_qubits} qubits ---")
+    print(f"--- Testing Bell State Simulation ({num_qubits} qubits) ---")
 
     # 1. Initialization
-    print("\n1. Instantiating QuantumSimulator...")
     sim = rocquantum_bind.QuantumSimulator(num_qubits=num_qubits)
-    print("   Instantiation successful.")
-
-    # 2. Test get_statevector
-    print("\n2. Testing get_statevector()...")
-    statevector = sim.get_statevector()
-    print(f"   Received statevector of size: {len(statevector)}")
-    print(f"   Statevector (first 4 elements): {statevector[:4]}")
-    assert len(statevector) == expected_sv_size, f"Statevector size should be {expected_sv_size}"
-    # Check if it's the |0...0> state
-    assert np.isclose(statevector[0], 1.0), "First element should be 1.0"
-    assert np.allclose(statevector[1:], 0.0), "All other elements should be 0.0"
-    print("   get_statevector() PASSED.")
-
-    # 3. Test apply_gate
-    print("\n3. Testing apply_gate()...")
+    
+    # 2. Create Bell State: H on qubit 0, CNOT on (0, 1)
+    print("\n1. Applying Hadamard to qubit 0...")
     sim.apply_gate("H", [0], [])
-    print("   apply_gate() called successfully.")
+    
+    print("2. Applying CNOT to (control=0, target=1)...")
+    sim.apply_gate("CNOT", [0, 1], [])
 
-    # 4. Test apply_matrix
-    print("\n4. Testing apply_matrix()...")
-    # A simple identity matrix for testing the binding call
-    identity_matrix = np.identity(2, dtype=np.complex128)
-    sim.apply_matrix(identity_matrix, [1])
-    print("   apply_matrix() called successfully.")
+    # 3. Get and verify the state vector
+    print("\n3. Verifying final state vector...")
+    statevector = sim.get_statevector()
+    
+    assert len(statevector) == expected_sv_size, f"Statevector size should be {expected_sv_size}"
+    
+    # Expected Bell state: 1/sqrt(2) * (|00> + |11>)
+    expected_state = np.zeros(expected_sv_size, dtype=np.complex128)
+    expected_state[0] = 1 / np.sqrt(2)
+    expected_state[3] = 1 / np.sqrt(2)
+    
+    print(f"   Expected state: {expected_state}")
+    print(f"   Actual state:   {statevector}")
+    
+    assert np.allclose(statevector, expected_state), "Final state vector does not match the expected Bell state."
+    print("   State vector PASSED.")
 
-    # 5. Test measure
-    print("\n5. Testing measure()...")
-    measurement_results = sim.measure(qubits=list(range(num_qubits)), shots=shots)
-    print(f"   Received {len(measurement_results)} measurement results.")
-    print(f"   First 10 results: {measurement_results[:10]}")
-    assert len(measurement_results) == shots, f"Should have received {shots} results"
-    # Check if all results are 0 (as per the stub implementation)
-    assert all(res == 0 for res in measurement_results), "All measurement results should be 0"
-    print("   measure() PASSED.")
+    # 4. Test measurement
+    print("\n4. Testing measurement...")
+    shots = 2000
+    measure_qubits = [0, 1]
+    results = sim.measure(measure_qubits, shots)
+    
+    assert len(results) == shots, f"Expected {shots} measurement shots, got {len(results)}"
+    
+    counts = {0: 0, 3: 0}
+    for r in results:
+        if r in counts:
+            counts[r] += 1
+    
+    print(f"   Measurement counts for states 0 (|00>) and 3 (|11>): {counts}")
+    # Check if results are close to 50/50 split
+    assert abs(counts[0] - shots/2) < shots/10, "Measurement of |00> is not within 10% tolerance."
+    assert abs(counts[3] - shots/2) < shots/10, "Measurement of |11> is not within 10% tolerance."
+    print("   Measurement PASSED.")
 
-    # 6. Test reset
-    print("\n6. Testing reset()...")
-    sim.reset()
-    print("   reset() called successfully.")
-
-    print("\n--- All binding tests completed successfully! ---")
+    print("\n--- Core simulation tests completed successfully! ---")
 
 if __name__ == "__main__":
-    test_simulator_bindings()
+    test_bell_state_simulation()

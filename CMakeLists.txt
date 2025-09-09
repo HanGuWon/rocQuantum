@@ -18,6 +18,7 @@ find_package(pybind11 REQUIRED)
 # ------------------------------------------------------------------
 add_library(rocquantum STATIC
     rocquantum/src/simulator.cpp
+    rocquantum/src/kernels.hip.cpp
 )
 
 # Add include directories for the library
