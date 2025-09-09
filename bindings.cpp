@@ -1,60 +1,38 @@
-// bindings.cpp
-
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
-#include <pybind11/complex.h>
-
-#include "rocquantum.h"
+#include "rocquantum/include/rocquantum.h"
 
 namespace py = pybind11;
 
-// Helper function to convert a NumPy array to std::vector<hipComplex>
-std::vector<hipComplex> numpy_to_hipComplex_vector(py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> arr) {
-    if (arr.ndim() != 2 || arr.shape(0) != 2 || arr.shape(1) != 2) {
-        throw std::runtime_error("Input must be a 2x2 NumPy array for a single-qubit gate.");
+// Helper function to convert numpy matrix to std::vector
+std::vector<std::complex<double>> numpy_to_std_vector(py::array_t<std::complex<double>> arr) {
+    py::buffer_info buf = arr.request();
+    if (buf.ndim != 2) {
+        throw std::runtime_error("NumPy array must be a 2D matrix");
     }
-    std::vector<hipComplex> vec(arr.size());
-    auto r = arr.unchecked<2>();
-    for (py::ssize_t i = 0; i < r.shape(0); i++) {
-        for (py::ssize_t j = 0; j < r.shape(1); j++) {
-            vec[i * r.shape(1) + j] = hipComplex(r(i, j).real(), r(i, j).imag());
-        }
-    }
-    return vec;
+    std::complex<double> *ptr = static_cast<std::complex<double> *>(buf.ptr);
+    return std::vector<std::complex<double>>(ptr, ptr + buf.size);
 }
 
 PYBIND11_MODULE(rocquantum_bind, m) {
-    m.doc() = "Python bindings for the rocQuantum C++ simulator library";
+    m.doc() = "Python bindings for the rocQuantum C++/HIP simulator";
 
-    py::class_<rocquantum::QSim>(m, "QSim")
-        .def(py::init<int>(), py::arg("num_qubits"), "Simulator constructor")
-        .def("ApplyGate",
-             py::overload_cast<const std::string&, int>(&rocquantum::QSim::ApplyGate),
-             "Applies a named single-qubit gate.",
-             py::arg("gate_name"), py::arg("target_qubit"))
-        .def("ApplyGate",
-             py::overload_cast<const std::string&, int, int>(&rocquantum::QSim::ApplyGate),
-             "Applies a named two-qubit gate.",
-             py::arg("gate_name"), py::arg("control_qubit"), py::arg("target_qubit"))
-        .def("ApplyGate",
-             [](rocquantum::QSim &self, py::array_t<std::complex<double>> gate_matrix, int target_qubit) {
-                 std::vector<hipComplex> matrix_vec = numpy_to_hipComplex_vector(gate_matrix);
-                 self.ApplyGate(matrix_vec, target_qubit);
-             },
-             "Applies a custom gate from a NumPy array.",
-             py::arg("gate_matrix"), py::arg("target_qubit"))
-        .def("Execute", &rocquantum::QSim::Execute, "Executes the circuit")
-        .def("GetStateVector",
-             [](const rocquantum::QSim &qsim) {
-                 std::vector<hipComplex> state_vec = qsim.GetStateVector();
-                 // Create a Python list of complex numbers
-                 py::list py_list;
-                 for (const auto& c : state_vec) {
-                     py_list.append(std::complex<double>(c.x, c.y));
-                 }
-                 // Convert the list to a NumPy array
-                 return py::array_t<std::complex<double>>(py_list);
-             },
-             "Returns the final state vector as a NumPy array.");
+    py::class_<rocquantum::QuantumSimulator>(m, "QuantumSimulator")
+        .def(py::init<unsigned>(), py::arg("num_qubits"))
+        .def("apply_gate", &rocquantum::QuantumSimulator::apply_gate, py::arg("gate_name"), py::arg("targets"), py::arg("params"))
+        .def("apply_matrix", [](rocquantum::QuantumSimulator &self, py::array_t<std::complex<double>> matrix, const std::vector<unsigned>& targets) {
+            self.apply_matrix(numpy_to_std_vector(matrix), targets);
+        }, py::arg("matrix"), py::arg("targets"))
+        .def("get_statevector", [](rocquantum::QuantumSimulator &self) {
+            std::vector<std::complex<double>> sv = self.get_statevector();
+            // Create a new numpy array and copy the data to avoid returning a pointer to a temporary vector.
+            py::array_t<std::complex<double>> result(sv.size());
+            py::buffer_info buf = result.request();
+            std::complex<double> *ptr = static_cast<std::complex<double> *>(buf.ptr);
+            std::copy(sv.begin(), sv.end(), ptr);
+            return result;
+        })
+        .def("measure", &rocquantum::QuantumSimulator::measure, py::arg("qubits"), py::arg("shots"))
+        .def("reset", &rocquantum::QuantumSimulator::reset, "Resets the simulator to the |0...0> state.");
 }
