@@ -1,72 +1,108 @@
-# rocQuantum-1
-[![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+# rocQuantum-1: A High-Performance Quantum Circuit Simulator for AMD GPUs
 
-rocQuantum-1 is a modern, high-performance quantum computing simulation framework specifically designed and optimized for AMD GPUs using the ROCm software stack. It provides a user-friendly Python interface with a powerful C++/HIP backend, aiming for feature parity with leading quantum frameworks.
+## Overview
 
-## Core Features
-- **High-Performance Backend:** Leverages AMD's HIP for massively parallel execution of quantum circuit simulations on AMD GPUs.
-- **Two Simulation Modes:**
-  - `StateVectorBackend`: For ideal, noise-free simulations of quantum states.
-  - `DensityMatrixBackend`: For realistic simulations including common quantum noise channels (e.g., depolarizing, bit-flip).
-- **Python-First Interface:** A simple and intuitive Python API (`rocq`) for defining quantum kernels, building circuits, and running simulations.
-- **Hybrid Workflow Support:** Includes high-level utilities for running hybrid quantum-classical algorithms like VQE, complete with integration for classical optimizers like `SciPy`.
+rocQuantum-1 is a high-performance quantum circuit simulator designed to leverage the computational power of AMD GPUs through the ROCm HIP programming model. Its primary goal is to provide a fast, seamless backend for leading quantum machine learning and computing frameworks, including PennyLane and Qiskit, enabling researchers and developers to simulate larger and more complex quantum systems than is feasible on traditional CPU-based simulators.
 
-## Quick Start: Expectation Value Calculation
+## Features
 
-Here is a complete example of defining a quantum circuit, specifying a Hamiltonian, and calculating its expectation value.
+*   **HIP-based GPU Acceleration:** Core quantum operations are executed on AMD GPUs for significant performance gains.
+*   **Seamless PennyLane Integration:** Implements the PennyLane `Device` API for easy use as a backend in PennyLane workflows.
+*   **Seamless Qiskit Integration:** Implements the Qiskit `BackendV2` API, allowing it to function as a standard backend via a custom provider.
+*   **Core Gate Support:** Includes high-performance kernels for essential quantum gates, including Hadamard, Pauli gates (X, Y, Z), parameterized rotations (RX, RY, RZ), and multi-qubit CNOT gates.
+
+## Benchmark Results
+
+Performance benchmarks show a significant advantage for rocQuantum-1 over standard CPU-based simulators, especially as the number of qubits increases. The simulation of the Quantum Fourier Transform (QFT) circuit highlights this performance gap.
+
+![PennyLane Benchmark Results](benchmarks/benchmark_results_pennylane.png)
+
+*As shown above, the logarithmic scale on the y-axis indicates an exponential speedup for the GPU-based rocQuantum-1 simulator.*
+
+## Build Instructions
+
+To build the rocQuantum-1 C++ core and the Python bindings, you will need a system with the ROCm toolkit, CMake, and a C++ compiler installed.
+
+1.  **Clone the repository:**
+    ```bash
+    git clone <repository-url>
+    cd rocQuantum-1
+    ```
+
+2.  **Create a build directory:**
+    ```bash
+    mkdir build
+    cd build
+    ```
+
+3.  **Configure the project with CMake:**
+    ```bash
+    cmake ..
+    ```
+
+4.  **Compile the project:**
+    ```bash
+    cmake --build . --config Release
+    ```
+
+This will create the `rocquantum.a` static library and the `rocquantum_bind.so` (or `.pyd`) Python module inside the `build` directory.
+
+## Installation & Usage
+
+After building the project, you can run the verification tests and use the simulator in your own Python projects.
+
+### Running Tests
+
+To verify that the simulator and framework plugins are working correctly, run the end-to-end test script from the project's root directory:
+
+```bash
+python tests/test_frameworks.py
+```
+
+### Usage in PennyLane
+
+To use rocQuantum-1 as a PennyLane device, simply specify `"rocq.pennylane"` as the device name.
 
 ```python
-import rocq
+import pennylane as qml
+import numpy as np
 
-# 1. Define a parameterized kernel to prepare a quantum state.
-@rocq.kernel
-def create_bell_state(theta: float, phi: float):
-    """A kernel to create a generalized Bell state."""
-    q = rocq.qvec(2)
-    rocq.h(q[0])
-    rocq.ry(theta, q[0])
-    rocq.cnot(q[0], q[1])
-    rocq.rz(phi, q[1])
+# The build directory must be in your Python path
+dev = qml.device("rocq.pennylane", wires=2, shots=1024)
 
-# 2. Define a Hamiltonian (e.g., H = 0.5*X0*Z1 + 0.2*Y0)
-hamiltonian = 0.5 * rocq.PauliOperator("X0 Z1") + 0.2 * rocq.PauliOperator("Y0")
+@qml.qnode(dev)
+def my_circuit():
+    qml.Hadamard(wires=0)
+    qml.CNOT(wires=[0, 1])
+    return qml.expval(qml.PauliZ(0))
 
-# 3. Execute the kernel and compute the expectation value.
-# The C++ backend is mocked, so this will return a placeholder value.
-exp_val = rocq.get_expectation_value(
-    create_bell_state,
-    hamiltonian,
-    backend='state_vector',
-    theta=0.0,
-    phi=0.0
-)
-
-print(f"Computed Expectation Value: <H> = {exp_val}")
+result = my_circuit()
+print(f"Expectation value: {result}")
 ```
 
-## Installation
-(Placeholder) Currently, installation requires building from source. Ensure you have a compatible ROCm environment (e.g., ROCm 5.x) and all necessary dependencies (e.g., CMake, C++ compiler).
+### Usage in Qiskit
 
-Clone the repository:
-```bash
-git clone https://your-repo-url/rocQuantum-1.git
-cd rocQuantum-1
-```
-Build the project:
-```bash
-mkdir build && cd build
-cmake ..
-make -j
-```
+To use rocQuantum-1 in Qiskit, import the custom provider and get the backend.
 
-## Running Tests
-The project uses CTest and GTest for its C++ backend tests. To run the tests, execute the following command from the `build` directory:
-```bash
-ctest
-```
+```python
+from qiskit import QuantumCircuit, transpile
+# Ensure the integrations and build directories are in your Python path
+from qiskit_rocquantum_provider.provider import RocQuantumProvider
 
-## Project Structure
-- **rocquantum/**: Core C++ source code and Python bindings.
-- **rocq/**: The user-facing Python package.
-- **examples/**: Example scripts demonstrating framework features.
-- **tests/**: C++ unit tests.
+# 1. Get the backend from the provider
+provider = RocQuantumProvider()
+backend = provider.get_backend("rocq_simulator")
+
+# 2. Create and run your circuit
+qc = QuantumCircuit(2, 2)
+qc.h(0)
+qc.cx(0, 1)
+qc.measure([0, 1], [0, 1])
+
+t_qc = transpile(qc, backend)
+job = backend.run(t_qc, shots=1024)
+result = job.result()
+counts = result.get_counts()
+
+print(f"Measurement counts: {counts}")
+```
