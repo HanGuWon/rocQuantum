@@ -271,6 +271,18 @@ rocqStatus_t rocsvApplyMultiControlledX(rocsvHandle_t handle, rocComplex* d_stat
  * @brief Applies a CSWAP (Fredkin) gate.
  */
 rocqStatus_t rocsvApplyCSWAP(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned controlQubit, unsigned targetQubit1, unsigned targetQubit2);
+
+/**
+ * @brief Copies the full batched state vector from device to host.
+ */
+rocqStatus_t rocsvGetStateVectorFull(rocsvHandle_t handle, rocComplex* d_state, rocComplex* h_state);
+
+/**
+ * @brief Copies a single slice of a batched state vector from device to host.
+ */
+rocqStatus_t rocsvGetStateVectorSlice(rocsvHandle_t handle, rocComplex* d_state, rocComplex* h_state, unsigned batch_index);
+
+
 // --- END NEWLY ADDED GATES ---
 
 // --- Pinned Memory Management ---

@@ -629,8 +629,7 @@ rocqStatus_t rocTensorSVD(rocTensorNetworkHandle_t handle,
                           rocquantum::util::rocTensor* U, 
                           rocquantum::util::rocTensor* S, 
                           rocquantum::util::rocTensor* V, 
-                          const rocquantum::util::rocTensor* A, 
-                          void* workspace) {
+                          const rocquantum::util::rocTensor* A) {
     if (A->rank() != 2) return ROCQ_STATUS_INVALID_VALUE;
 
     rocsolver_handle rocsolver_h;
@@ -645,15 +644,36 @@ rocqStatus_t rocTensorSVD(rocTensorNetworkHandle_t handle,
     S->dimensions_ = {k}; S->calculate_strides(); rocquantum::util::rocTensorAllocate(S);
     V->dimensions_ = {k, n}; V->calculate_strides(); rocquantum::util::rocTensorAllocate(V);
 
-    // Assuming double precision for now. A robust implementation would switch based on handle's dtype.
-    rocsolver_dgesvd(rocsolver_h, 'S', 'S', m, n, 
-                     (rocDoubleComplex*)A->data_, m, 
-                     (double*)S->data_, 
-                     (rocDoubleComplex*)U->data_, m, 
-                     (rocDoubleComplex*)V->data_, k, 
-                     (rocDoubleComplex*)workspace, 
-                     nullptr);
+    void* workspace_ptr = nullptr;
+    size_t workspace_size = 0;
 
+    // Switch based on data type
+    if (handle->tn_instance->dtype == ROC_DATATYPE_C128) {
+        rocsolver_dgesvd_bufferSize(rocsolver_h, 'S', 'S', m, n, &workspace_size);
+        hipMalloc(&workspace_ptr, workspace_size);
+        rocsolver_dgesvd(rocsolver_h, 'S', 'S', m, n, 
+                         (rocDoubleComplex*)A->data_, m, 
+                         (double*)S->data_, 
+                         (rocDoubleComplex*)U->data_, m, 
+                         (rocDoubleComplex*)V->data_, k, 
+                         (rocDoubleComplex*)workspace_ptr, 
+                         nullptr);
+    } else if (handle->tn_instance->dtype == ROC_DATATYPE_C64) {
+        rocsolver_cgesvd_bufferSize(rocsolver_h, 'S', 'S', m, n, &workspace_size);
+        hipMalloc(&workspace_ptr, workspace_size);
+        rocsolver_cgesvd(rocsolver_h, 'S', 'S', m, n, 
+                         (rocComplex*)A->data_, m, 
+                         (float*)S->data_, 
+                         (rocComplex*)U->data_, m, 
+                         (rocComplex*)V->data_, k, 
+                         (rocComplex*)workspace_ptr, 
+                         nullptr);
+    } else {
+        rocsolver_destroy_handle(rocsolver_h);
+        return ROCQ_STATUS_NOT_IMPLEMENTED;
+    }
+
+    hipFree(workspace_ptr);
     rocsolver_destroy_handle(rocsolver_h);
     return ROCQ_STATUS_SUCCESS;
 }

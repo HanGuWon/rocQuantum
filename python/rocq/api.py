@@ -225,6 +225,68 @@ class Circuit:
         except RuntimeError as e:
             raise RuntimeError(f"Sample failed: {e}")
 
+    def get_statevector(self) -> np.ndarray:
+        """
+        Flushes the execution queue and returns the final state vector from the GPU.
+        Note: This involves a device-to-host memory transfer and can be slow.
+        """
+        self.flush()
+        if self.batch_size > 1:
+            raise NotImplementedError("get_statevector is not yet supported for batch_size > 1.")
+        
+        num_elements = 1 << self.num_qubits
+        np_state = backend.get_state_vector(self._sim_handle, self._get_d_state_for_backend(), num_elements)
+        return np_state
+
+    def expval(self, pauli_operator: 'PauliOperator') -> float:
+        """
+        Calculates the expectation value of a Pauli operator with respect to the circuit's final state.
+        """
+        if not isinstance(pauli_operator, PauliOperator):
+            raise TypeError("Input must be a PauliOperator object.")
+
+        psi = self.get_statevector()
+        total_exp_val = 0.0
+
+        for pauli_term, coeff in pauli_operator.terms:
+            if not pauli_term: # Identity term
+                total_exp_val += coeff
+                continue
+
+            p_psi = psi.copy()
+            for pauli_char, qubit_idx in pauli_term:
+                p_psi = self._apply_pauli_to_state_np(p_psi, pauli_char, qubit_idx)
+            
+            term_exp_val = np.vdot(psi, p_psi).real
+            total_exp_val += coeff * term_exp_val
+            
+        return total_exp_val
+
+    def _apply_pauli_to_state_np(self, psi: np.ndarray, pauli: str, target: int) -> np.ndarray:
+        """Helper to apply a single Pauli operator to a statevector in NumPy."""
+        num_qubits = self.num_qubits
+        psi_tensor = psi.reshape([2] * num_qubits)
+        
+        axes = list(range(num_qubits))
+        axes[0], axes[target] = axes[target], axes[0]
+        psi_tensor = np.transpose(psi_tensor, axes)
+
+        if pauli == 'X':
+            op_matrix = np.array([[0, 1], [1, 0]])
+        elif pauli == 'Y':
+            op_matrix = np.array([[0, -1j], [1j, 0]])
+        elif pauli == 'Z':
+            op_matrix = np.array([[1, 0], [0, -1]])
+        else:
+            op_matrix = np.identity(2)
+
+        psi_tensor = psi_tensor.reshape(2, -1)
+        psi_tensor = op_matrix @ psi_tensor
+        psi_tensor = psi_tensor.reshape([2] * num_qubits)
+
+        psi_tensor = np.transpose(psi_tensor, axes)
+        return psi_tensor.flatten()
+
 
 class PauliOperator:
     def __init__(self, terms: dict[str, float] | str = None):

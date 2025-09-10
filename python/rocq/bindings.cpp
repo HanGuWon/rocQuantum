@@ -463,6 +463,26 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
            py::arg("control_qubits"), py::arg("target_qubits"), py::arg("matrix_device"),
            "Applies a matrix to target qubits, controlled by control qubits.");
 
+    m.def("get_state_vector_full", [](const RocsvHandleWrapper& handle, DeviceBuffer& d_state_buffer, unsigned num_qubits, size_t batch_size) {
+        size_t num_elements = batch_size * (1ULL << num_qubits);
+        py::array_t<rocComplex> h_state(num_elements);
+        rocqStatus_t status = rocsvGetStateVectorFull(handle.get(), d_state_buffer.get_ptr<rocComplex>(), h_state.mutable_data());
+        if (status != ROCQ_STATUS_SUCCESS) {
+            throw std::runtime_error("rocsvGetStateVectorFull failed: " + std::to_string(status));
+        }
+        return h_state;
+    }, py::arg("handle"), py::arg("d_state").noconvert(), py::arg("num_qubits"), py::arg("batch_size"));
+
+    m.def("get_state_vector_slice", [](const RocsvHandleWrapper& handle, DeviceBuffer& d_state_buffer, unsigned num_qubits, size_t batch_size, unsigned batch_index) {
+        size_t num_elements = 1ULL << num_qubits;
+        py::array_t<rocComplex> h_state(num_elements);
+        rocqStatus_t status = rocsvGetStateVectorSlice(handle.get(), d_state_buffer.get_ptr<rocComplex>(), h_state.mutable_data(), batch_index);
+        if (status != ROCQ_STATUS_SUCCESS) {
+            throw std::runtime_error("rocsvGetStateVectorSlice failed: " + std::to_string(status));
+        }
+        return h_state;
+    }, py::arg("handle"), py::arg("d_state").noconvert(), py::arg("num_qubits"), py::arg("batch_size"), py::arg("batch_index"));
+
     // Add a helper to create a DeviceBuffer and copy a numpy array to it
     m.def("create_device_matrix_from_numpy",
         [](py::array_t<rocComplex, py::array::c_style | py::array::forcecast> np_array) {
