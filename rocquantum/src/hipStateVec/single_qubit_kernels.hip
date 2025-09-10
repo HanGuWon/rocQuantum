@@ -77,24 +77,25 @@ __global__ void apply_single_qubit_generic_matrix_kernel(rocComplex* state,
 // --- Specific Gate Kernels (can call the generic one or be specialized) ---
 
 // Pauli-X Gate
-__global__ void apply_X_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit) {
-    // X = [[0, 1], [1, 0]]
-    // M00=0, M10=1, M01=1, M11=0
-    size_t N = 1ULL << numQubits;
-    size_t k = 1ULL << targetQubit;
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    size_t outer_loop_factor = 1ULL << (targetQubit + 1);
-    size_t inner_loop_factor = k;
-    size_t group_idx = tid / inner_loop_factor;
-    size_t in_group_idx = tid % inner_loop_factor;
-    size_t idx0 = group_idx * outer_loop_factor + in_group_idx;
-    size_t idx1 = idx0 + inner_loop_factor;
+__global__ void apply_X_kernel(rocComplex* state, unsigned numQubits, unsigned targetQubit, size_t batchSize) {
+    size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_threads = (size_t)gridDim.x * blockDim.x;
 
-    if (idx1 < N) {
-        rocComplex temp = state[idx0];
-        state[idx0] = state[idx1];
-        state[idx1] = temp;
+    size_t num_elements_per_state = 1ULL << numQubits;
+    size_t total_pairs = batchSize * (num_elements_per_state / 2);
+
+    for (size_t i = tid; i < total_pairs; i += total_threads) {
+        size_t batch_idx = i / (num_elements_per_state / 2);
+        size_t pair_idx_in_batch = i % (num_elements_per_state / 2);
+
+        size_t k = 1ULL << targetQubit;
+        size_t idx0 = (pair_idx_in_batch & ~(k - 1)) * 2 + (pair_idx_in_batch & (k - 1));
+        size_t idx1 = idx0 + k;
+
+        size_t batch_offset = batch_idx * num_elements_per_state;
+        rocComplex temp = state[batch_offset + idx0];
+        state[batch_offset + idx0] = state[batch_offset + idx1];
+        state[batch_offset + idx1] = temp;
     }
 }
 

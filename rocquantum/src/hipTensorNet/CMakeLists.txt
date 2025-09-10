@@ -6,6 +6,7 @@ find_package(HIP REQUIRED)
 
 # Find rocBLAS (needed for rocTensorUtil's conceptual contraction wrapper)
 find_package(rocblas REQUIRED)
+find_package(rocsolver REQUIRED) # Find rocSOLVER
 
 # Define the library for hipTensorNet and rocTensorUtil components
 add_library(rocqsim_tensornet STATIC
@@ -22,12 +23,14 @@ target_include_directories(rocqsim_tensornet PUBLIC
     
     ${HIP_INCLUDE_DIRS}
     ${rocblas_INCLUDE_DIRS}
+    ${rocsolver_INCLUDE_DIRS}
 )
 
 # Link libraries
 target_link_libraries(rocqsim_tensornet PUBLIC
     ${HIP_LIBRARIES}
     roc::rocblas         # Using rocBLAS imported target
+    roc::rocsolver       # Using rocSOLVER imported target
 )
 
 # If rocTensorUtil_kernels.hip needs to be compiled as part of this static library:

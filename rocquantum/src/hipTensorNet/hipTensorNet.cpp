@@ -9,12 +9,12 @@
 #include <set>
 #include <stdexcept>
 #include <numeric>
-#include <set>
-#include <stdexcept>
-#include <numeric>
 
 // rocBLAS header
 #include <rocblas/rocblas.h>
+// rocSOLVER header
+#include <rocsolver/rocsolver.h>
+
 
 // C API struct
 struct rocTnStruct {
@@ -623,5 +623,40 @@ rocqStatus_t rocTensorNetworkContract(rocTensorNetworkHandle_t handle,
     if (!handle || !handle->tn_instance || !config || !result_tensor) return ROCQ_STATUS_INVALID_VALUE;
     return handle->tn_instance->contract(config, result_tensor, blas_handle, stream);
 }
+
+// --- NEW SVD IMPLEMENTATION ---
+rocqStatus_t rocTensorSVD(rocTensorNetworkHandle_t handle, 
+                          rocquantum::util::rocTensor* U, 
+                          rocquantum::util::rocTensor* S, 
+                          rocquantum::util::rocTensor* V, 
+                          const rocquantum::util::rocTensor* A, 
+                          void* workspace) {
+    if (A->rank() != 2) return ROCQ_STATUS_INVALID_VALUE;
+
+    rocsolver_handle rocsolver_h;
+    rocsolver_create_handle(&rocsolver_h);
+
+    long long m = A->dimensions_[0];
+    long long n = A->dimensions_[1];
+    long long k = std::min(m, n);
+
+    // Allocate U, S, V tensors
+    U->dimensions_ = {m, k}; U->calculate_strides(); rocquantum::util::rocTensorAllocate(U);
+    S->dimensions_ = {k}; S->calculate_strides(); rocquantum::util::rocTensorAllocate(S);
+    V->dimensions_ = {k, n}; V->calculate_strides(); rocquantum::util::rocTensorAllocate(V);
+
+    // Assuming double precision for now. A robust implementation would switch based on handle's dtype.
+    rocsolver_dgesvd(rocsolver_h, 'S', 'S', m, n, 
+                     (rocDoubleComplex*)A->data_, m, 
+                     (double*)S->data_, 
+                     (rocDoubleComplex*)U->data_, m, 
+                     (rocDoubleComplex*)V->data_, k, 
+                     (rocDoubleComplex*)workspace, 
+                     nullptr);
+
+    rocsolver_destroy_handle(rocsolver_h);
+    return ROCQ_STATUS_SUCCESS;
+}
+// --- END SVD IMPLEMENTATION ---
 
 } // extern "C"

@@ -58,7 +58,7 @@ rocqStatus_t rocsvDestroy(rocsvHandle_t handle);
  * @param[out] d_state Pointer to the device memory for the state vector.
  * @return rocqStatus_t Status of the operation.
  */
-rocqStatus_t rocsvAllocateState(rocsvHandle_t handle, unsigned numQubits, rocComplex** d_state);
+rocqStatus_t rocsvAllocateState(rocsvHandle_t handle, unsigned numQubits, rocComplex** d_state, size_t batchSize);
 
 /**
  * @brief Initializes the state vector to the |0...0> state.
@@ -245,6 +245,33 @@ rocqStatus_t rocsvApplyCZ(rocsvHandle_t handle, rocComplex* d_state, unsigned nu
  * @param qubit2 Index of the second qubit.
  */
 rocqStatus_t rocsvApplySWAP(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned qubit1, unsigned qubit2);
+
+// --- NEWLY ADDED GATES ---
+/**
+ * @brief Applies a Controlled-RX gate.
+ */
+rocqStatus_t rocsvApplyCRX(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned controlQubit, unsigned targetQubit, double theta);
+
+/**
+ * @brief Applies a Controlled-RY gate.
+ */
+rocqStatus_t rocsvApplyCRY(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned controlQubit, unsigned targetQubit, double theta);
+
+/**
+ * @brief Applies a Controlled-RZ gate.
+ */
+rocqStatus_t rocsvApplyCRZ(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned controlQubit, unsigned targetQubit, double theta);
+
+/**
+ * @brief Applies a multi-controlled X (Toffoli, etc.) gate.
+ */
+rocqStatus_t rocsvApplyMultiControlledX(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, const unsigned* controlQubits, unsigned numControlQubits, unsigned targetQubit);
+
+/**
+ * @brief Applies a CSWAP (Fredkin) gate.
+ */
+rocqStatus_t rocsvApplyCSWAP(rocsvHandle_t handle, rocComplex* d_state, unsigned numQubits, unsigned controlQubit, unsigned targetQubit1, unsigned targetQubit2);
+// --- END NEWLY ADDED GATES ---
 
 // --- Pinned Memory Management ---
 /**

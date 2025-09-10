@@ -1,5 +1,6 @@
 set(HIPSTATEVEC_SRC
     hipStateVec.cpp
+    GateFusion.cpp
     single_qubit_kernels.hip
     two_qubit_kernels.hip
     measurement_kernels.hip

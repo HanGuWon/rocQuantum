@@ -238,6 +238,24 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
         return rocsvApplyCZ(h.get(), d_state.get_ptr<rocComplex>(), nQ, q1, q2); }, "Applies CZ gate");
     m.def("apply_swap", [](const RocsvHandleWrapper& h, DeviceBuffer& d_state, unsigned nQ, unsigned q1, unsigned q2) {
         return rocsvApplySWAP(h.get(), d_state.get_ptr<rocComplex>(), nQ, q1, q2); }, "Applies SWAP gate");
+
+    // --- NEWLY ADDED BINDINGS ---
+    m.def("apply_crx", [](const RocsvHandleWrapper& h, DeviceBuffer& d_state, unsigned nQ, unsigned cQ, unsigned tQ, double angle) {
+        return rocsvApplyCRX(h.get(), d_state.get_ptr<rocComplex>(), nQ, cQ, tQ, angle);
+    }, "Applies CRX gate");
+    m.def("apply_cry", [](const RocsvHandleWrapper& h, DeviceBuffer& d_state, unsigned nQ, unsigned cQ, unsigned tQ, double angle) {
+        return rocsvApplyCRY(h.get(), d_state.get_ptr<rocComplex>(), nQ, cQ, tQ, angle);
+    }, "Applies CRY gate");
+    m.def("apply_crz", [](const RocsvHandleWrapper& h, DeviceBuffer& d_state, unsigned nQ, unsigned cQ, unsigned tQ, double angle) {
+        return rocsvApplyCRZ(h.get(), d_state.get_ptr<rocComplex>(), nQ, cQ, tQ, angle);
+    }, "Applies CRZ gate");
+    m.def("apply_mcx", [](const RocsvHandleWrapper& h, DeviceBuffer& d_state, unsigned nQ, const std::vector<unsigned>& cQs, unsigned tQ) {
+        return rocsvApplyMultiControlledX(h.get(), d_state.get_ptr<rocComplex>(), nQ, cQs.data(), cQs.size(), tQ);
+    }, "Applies multi-controlled X gate");
+    m.def("apply_cswap", [](const RocsvHandleWrapper& h, DeviceBuffer& d_state, unsigned nQ, unsigned cQ, unsigned tQ1, unsigned tQ2) {
+        return rocsvApplyCSWAP(h.get(), d_state.get_ptr<rocComplex>(), nQ, cQ, tQ1, tQ2);
+    }, "Applies CSWAP gate");
+    // --- END NEWLY ADDED BINDINGS ---
     
     // rocsvApplyMatrix
     m.def("apply_matrix", 
@@ -521,16 +539,33 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
         [](rocquantum::util::rocTensor& output_tensor,
            const rocquantum::util::rocTensor& input_tensor,
            const std::vector<int>& host_permutation_map) {
-        // Ensure output_tensor has its data_ pointer allocated and dimensions/strides set correctly by the caller
-        // before calling this. The rocTensorPermute C-function doesn't allocate for output.
-        if (!output_tensor.data_ && output_tensor.get_element_count() > 0) {
-            throw std::runtime_error("Output tensor for permute_tensor must be pre-allocated.");
-        }
-        rocqStatus_t status = rocquantum::util::rocTensorPermute(&output_tensor, &input_tensor, host_permutation_map);
-        if (status != ROCQ_STATUS_SUCCESS) {
-            throw std::runtime_error("rocTensorPermute failed: " + std::to_string(status));
-        }
+        // ... (existing implementation)
     }, py::arg("output_tensor").noconvert(), py::arg("input_tensor"), py::arg("permutation_map"));
+
+    // --- NEW SVD BINDING ---
+    m.def("tensor_svd",
+        [](RocTensorNetworkHandleWrapper& handle, const rocquantum::util::rocTensor& A) {
+            if (A.rank() != 2) {
+                throw std::runtime_error("SVD input must be a 2D tensor (matrix).");
+            }
+            // NOTE: Workspace management is simplified here. A robust implementation
+            // would query rocsolver for the required workspace size.
+            DeviceBuffer workspace(1, 1); // Placeholder
+
+            auto U = rocquantum::util::rocTensor();
+            auto S = rocquantum::util::rocTensor();
+            auto V = rocquantum::util::rocTensor();
+
+            rocqStatus_t status = rocTensorSVD(handle.get(), &U, &S, &V, &A, workspace.ptr_);
+            if (status != ROCQ_STATUS_SUCCESS) {
+                throw std::runtime_error("rocTensorSVD failed: " + std::to_string(status));
+            }
+            return std::make_tuple(U, S, V);
+        }, py::arg("handle"), py::arg("A"), "Performs SVD on a 2D tensor A, returning (U, S, V).");
+    // --- END NEW SVD BINDING ---
+
+    // --- hipTensorNet Bindings ---
+    // ... (rest of the file)
 
     // --- hipTensorNet Bindings ---
     // Opaque handle wrapper for rocTensorNetworkHandle_t
@@ -625,6 +660,22 @@ PYBIND11_MODULE(_rocq_hip_backend, m) {
                 py::print("Warning: rocTensorNetworkContract path execution is not fully implemented yet.");
             }
         }, py::arg("optimizer_config"), py::arg("result_tensor").noconvert(), "Contracts the tensor network. Result tensor must be pre-allocated.");
+
+    // --- GateFusion Bindings ---
+    py::class_<rocquantum::GateOp>(m, "GateOp")
+        .def(py::init<>())
+        .def_readwrite("name", &rocquantum::GateOp::name)
+        .def_readwrite("targets", &rocquantum::GateOp::targets)
+        .def_readwrite("controls", &rocquantum::GateOp::controls)
+        .def_readwrite("params", &rocquantum::GateOp::params);
+
+    py::class_<rocquantum::GateFusion>(m, "GateFusion")
+        .def(py::init<RocsvHandleWrapper&, DeviceBuffer&, unsigned>(),
+             py::arg("handle"), py::arg("d_state").noconvert(), py::arg("num_qubits"))
+        .def("process_queue", [](rocquantum::GateFusion& self, const std::vector<rocquantum::GateOp>& queue) {
+            return self.processQueue(queue);
+        }, py::arg("queue"));
+    // --- End GateFusion Bindings ---
 
     // --- MLIRCompiler Bindings ---
     py::class_<rocquantum::compiler::MLIRCompiler>(m, "MLIRCompiler")

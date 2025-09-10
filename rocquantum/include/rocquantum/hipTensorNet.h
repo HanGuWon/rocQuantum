@@ -137,6 +137,27 @@ rocqStatus_t rocTensorNetworkContract(rocTensorNetworkHandle_t handle,
                                       rocblas_handle blas_handle,
                                       hipStream_t stream);
 
+// --- NEW SVD FUNCTION ---
+/**
+ * @brief Performs Singular Value Decomposition (SVD) on a 2D tensor (matrix).
+ * Decomposes A into U * S * V^H.
+ *
+ * @param[in] handle The tensor network handle (used for rocSOLVER handle creation).
+ * @param[out] U The resulting unitary matrix U.
+ * @param[out] S The resulting singular values (a vector).
+ * @param[out] V The resulting unitary matrix V.
+ * @param[in] A The input matrix to decompose.
+ * @param[in] workspace A pre-allocated device buffer for rocSOLVER to use.
+ * @return rocqStatus_t Status of the operation.
+ */
+rocqStatus_t rocTensorSVD(rocTensorNetworkHandle_t handle,
+                          rocquantum::util::rocTensor* U,
+                          rocquantum::util::rocTensor* S,
+                          rocquantum::util::rocTensor* V,
+                          const rocquantum::util::rocTensor* A,
+                          void* workspace);
+// --- END NEW SVD FUNCTION ---
+
 #ifdef __cplusplus
 } // extern "C"
 #endif // __cplusplus

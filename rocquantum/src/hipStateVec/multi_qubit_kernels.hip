@@ -211,24 +211,45 @@ __global__ void gather_elements_kernel_v2(
 // Scatters 2^m elements for a *single* specified configuration of non-target qubits.
 // Launched with matrix_dim threads.
 // base_idx_non_targets: The component of the index determined by the fixed state of non-target qubits for this specific scatter op.
+// This refined kernel is called by the host 2^(N-m) times.
 __global__ void scatter_elements_kernel_v2(
     rocComplex* d_out_strided,              // Output: Full state vector (size 2^N)
-    const rocComplex* d_in_contiguous,      // Input: Contiguous buffer of size 2^m (matrix_dim)
-    const unsigned* targetQubitIndices_gpu, // m target qubit indices (on GPU, assumed sorted)
-    unsigned m,                             // Number of target qubits
-    size_t base_idx_non_targets) {          // Index component from non-target qubits
+    const rocComplex* d_in_local,           // Input: Small local vector (size 2^m)
+    const unsigned* targetQubits_gpu, // m target qubit indices (on GPU, assumed sorted)
+    unsigned numTargetQubits,               // m
+    size_t base_idx_for_non_targets         // The base index calculated from non-target qubit states
+);
 
-    unsigned matrix_dim = 1U << m;
-    unsigned i = threadIdx.x + blockIdx.x * blockDim.x; // i from 0 to matrix_dim - 1
 
-    if (i < matrix_dim) {
-        size_t target_config_component = 0;
-        // Construct the target qubit component of the index based on bits of 'i'
-        for (unsigned k = 0; k < m; ++k) {
-            if (((i >> k) & 1)) { // If k-th bit of 'i' is 1
-                target_config_component |= (1ULL << targetQubitIndices_gpu[k]);
-            }
-        }
-        d_out_strided[base_idx_non_targets | target_config_component] = d_in_contiguous[i];
-    }
-}
+// --- NEWLY ADDED KERNELS ---
+
+// Generic kernel for applying a multi-controlled single-target gate (e.g., X, Z)
+__global__ void apply_multi_controlled_gate_kernel(
+    rocComplex* state,
+    unsigned numQubits,
+    const unsigned* controlQubits_gpu,
+    unsigned numControlQubits,
+    unsigned targetQubit,
+    const rocComplex* gateMatrix_gpu // 2x2 matrix for the target operation (e.g., Pauli X)
+);
+
+// Kernel for applying a controlled rotation gate (CRX, CRY, CRZ)
+__global__ void apply_controlled_rotation_kernel(
+    rocComplex* state,
+    unsigned numQubits,
+    unsigned controlQubit,
+    unsigned targetQubit,
+    const rocComplex* gateMatrix_gpu // 2x2 rotation matrix
+);
+
+// Kernel for CSWAP (Fredkin) gate
+__global__ void apply_CSWAP_kernel(
+    rocComplex* state,
+    unsigned numQubits,
+    unsigned controlQubit,
+    unsigned targetQubit1,
+    unsigned targetQubit2
+);
+
+// --- END NEWLY ADDED KERNELS ---
+
