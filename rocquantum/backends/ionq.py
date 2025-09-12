@@ -10,14 +10,11 @@ status monitoring, and result retrieval.
 """
 
 import os
-import requests
-from typing import Dict
+from typing import Dict, Any
 
 from .base import (
     RocqBackend,
     BackendAuthenticationError,
-    JobSubmissionError,
-    ResultRetrievalError,
 )
 
 # The base URL for the IonQ API, version 0.3
@@ -75,26 +72,18 @@ class IonQBackend(RocqBackend):
             )
         return {"Authorization": f"ApiKey {self.api_key}"}
 
-    def submit_job(self, circuit_representation: str, shots: int) -> str:
+    def _build_payload(self, circuit_representation: str, shots: int) -> Dict[str, Any]:
         """
-        Submits a quantum circuit in OpenQASM format to the IonQ backend.
+        Constructs the provider-specific JSON payload for an IonQ job request.
 
         Args:
-            circuit_representation (str): A string containing the OpenQASM 3.0
-                                          representation of the quantum circuit.
-            shots (int): The number of times the circuit will be executed.
+            circuit_representation (str): The OpenQASM 3.0 string for the circuit.
+            shots (int): The number of execution shots.
 
         Returns:
-            str: The unique job ID assigned by IonQ for tracking.
-
-        Raises:
-            JobSubmissionError: If the API request fails or returns an
-                                unsuccessful status code.
+            Dict[str, Any]: The JSON payload for the API request.
         """
-        headers = self._get_auth_headers()
-        headers["Content-Type"] = "application/json"
-
-        payload = {
+        return {
             "target": self.backend_name,
             "shots": shots,
             "body": {
@@ -102,102 +91,3 @@ class IonQBackend(RocqBackend):
                 "program": circuit_representation,
             },
         }
-
-        try:
-            response = requests.post(
-                f"{self.api_endpoint}/jobs", headers=headers, json=payload
-            )
-            response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
-        except requests.exceptions.RequestException as e:
-            raise JobSubmissionError(f"Job submission failed due to a network error: {e}")
-
-        response_data = response.json()
-        job_id = response_data.get("id")
-
-        if not job_id:
-            raise JobSubmissionError(
-                f"Job submission failed: API response did not contain a job ID. "
-                f"Response: {response_data}"
-            )
-
-        return job_id
-
-    def get_job_status(self, job_id: str) -> str:
-        """
-        Retrieves the current status of a job from the IonQ API.
-
-        Args:
-            job_id (str): The ID of the job to check.
-
-        Returns:
-            str: The status of the job (e.g., 'ready', 'running', 'completed').
-
-        Raises:
-            ResultRetrievalError: If the API request to get the job status fails.
-        """
-        try:
-            response = requests.get(
-                f"{self.api_endpoint}/jobs/{job_id}", headers=self._get_auth_headers()
-            )
-            response.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            raise ResultRetrievalError(f"Failed to get job status for job '{job_id}': {e}")
-
-        response_data = response.json()
-        status = response_data.get("status")
-
-        if not status:
-            raise ResultRetrievalError(
-                f"API response for job '{job_id}' did not contain a status. "
-                f"Response: {response_data}"
-            )
-            
-        return status
-
-    def get_job_result(self, job_id: str) -> Dict[str, int]:
-        """
-        Retrieves the results for a completed job from the IonQ API.
-
-        Args:
-            job_id (str): The ID of the job to retrieve results for.
-
-        Returns:
-            Dict[str, int]: A dictionary containing the measurement histogram,
-                            where keys are measurement outcomes (as strings
-                            representing integers) and values are the counts.
-
-        Raises:
-            ResultRetrievalError: If the job is not yet complete, or if the
-                                  API request to get the results fails.
-        """
-        status = self.get_job_status(job_id)
-        if status != "completed":
-            raise ResultRetrievalError(
-                f"Cannot retrieve results for job '{job_id}' because its "
-                f"status is '{status}'. Results are only available for "
-                "'completed' jobs."
-            )
-
-        try:
-            response = requests.get(
-                f"{self.api_endpoint}/jobs/{job_id}", headers=self._get_auth_headers()
-            )
-            response.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            raise ResultRetrievalError(f"Failed to retrieve results for job '{job_id}': {e}")
-
-        response_data = response.json()
-        
-        # Note: IonQ returns histogram keys as strings of integers. For true
-        # bitstring representation, one would need to know the number of
-        # measured qubits to format them (e.g., '1' -> '01'). Here, we return
-        # the direct output from the API.
-        histogram = response_data.get("data", {}).get("histogram")
-
-        if histogram is None:
-             raise ResultRetrievalError(
-                f"API response for job '{job_id}' did not contain a histogram. "
-                f"Response: {response_data}"
-            )
-
-        return histogram

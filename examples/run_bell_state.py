@@ -94,5 +94,31 @@ def main():
     except Exception as e:
         print(f"[ERROR] Could not run on Qristal backend: {e}\n")
 
+    # --- Execution on a Type C Backend (Cloud Intermediary SDK) ---
+    print("--- Running on a Type C Backend (Rigetti via AWS Braket) ---")
+    try:
+        # 2. Set the Target Backend
+        # This demonstrates using a cloud provider's SDK.
+        # NOTE: Requires AWS credentials (e.g., AWS_ACCESS_KEY_ID) to be set.
+        if not os.getenv("AWS_ACCESS_KEY_ID"):
+            raise EnvironmentError("AWS_ACCESS_KEY_ID not set. Skipping Rigetti execution.")
+
+        set_target('rigetti')
+        backend = get_active_backend()
+
+        # 3. Submit the Job
+        # Like Type A, this backend expects a QASM string.
+        print("--> Submitting job to Rigetti on AWS Braket...")
+        # NOTE: This will fail if your S3 bucket location in rigetti.py is not configured.
+        # This is a demonstration of the submission call.
+        job_id = backend.submit_job(bell_circuit.to_qasm(), shots=100)
+        print(f"--> Job submitted. AWS Braket Task ARN: {job_id}")
+        print("--> NOTE: AWS Braket is asynchronous. You would typically poll for results.")
+        print("    (Result polling not shown in this example for brevity.)\n")
+
+    except Exception as e:
+        print(f"[ERROR] Could not run on Rigetti backend: {e}\n")
+
+
 if __name__ == "__main__":
     main()

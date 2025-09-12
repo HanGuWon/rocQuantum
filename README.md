@@ -1,13 +1,14 @@
-# rocQuantum
+# rocQuantum Version 1.0
 
 A hardware-agnostic quantum computing framework, inspired by the architecture of NVIDIA's CUDA-Q, designed to provide a unified interface for executing quantum circuits across a wide range of third-party quantum processing units (QPUs).
 
 ## Description
 
-The core goal of rocQuantum is to offer a seamless user experience where a quantum circuit can be defined once and then executed on different hardware backends—from remote, API-based cloud platforms to local, SDK-driven simulators—with minimal changes to the code. This is achieved through a robust backend abstraction layer that supports two primary integration models:
+The core goal of rocQuantum is to offer a seamless user experience where a quantum circuit can be defined once and then executed on different hardware backends—from remote cloud platforms to local simulators—with minimal changes to the code. This is achieved through a robust backend abstraction layer that supports multiple integration models:
 
-*   **Type A (Indirect):** For API-based services (e.g., IonQ, Quantinuum), rocQuantum manages the HTTP client, authentication, and job lifecycle internally.
-*   **Type B (Direct):** For providers that require a local SDK (e.g., Quantum Brilliance), rocQuantum interfaces directly with the provider's tools.
+*   **Type A (Remote API):** For API-based services (e.g., IonQ, Pasqal), rocQuantum manages the HTTP client, authentication, and job lifecycle internally.
+*   **Type B (Local SDK):** For providers that require a local SDK (e.g., Quantum Brilliance's Qristal), rocQuantum interfaces directly with the provider's tools for synchronous execution.
+*   **Type C (Cloud Intermediary):** For platforms accessed via a cloud provider's SDK (e.g., Rigetti on AWS Braket), rocQuantum handles the interaction with the intermediary service.
 
 ## Installation
 
@@ -19,119 +20,73 @@ The core goal of rocQuantum is to offer a seamless user experience where a quant
 
 2.  Install the required Python packages:
     ```bash
-    pip install -r requirements.txt
+    pip install requests boto3
+    ```
+    *(Note: Specific provider SDKs like `qiskit` or `cirq` should be installed as needed).*
+
+## Configuration
+
+To access third-party backends, you must configure your credentials using environment variables.
+
+*   **For IonQ:**
+    ```bash
+    export IONQ_API_KEY="YOUR_IONQ_API_KEY"
     ```
 
-3.  Configure backend credentials by setting the appropriate environment variables (e.g., `IONQ_API_KEY`, `CUDAQ_QUANTINUUM_CREDENTIALS`).
+*   **For Quantinuum:**
+    ```bash
+    export CUDAQ_QUANTINUUM_CREDENTIALS="YOUR_USERNAME,YOUR_PASSWORD"
+    ```
+
+*   **For Rigetti (via AWS Braket):**
+    The Rigetti backend uses the `boto3` library, which automatically finds AWS credentials. Configure them using standard AWS methods, such as:
+    *   Environment Variables:
+        ```bash
+        export AWS_ACCESS_KEY_ID="YOUR_AWS_ACCESS_KEY"
+        export AWS_SECRET_ACCESS_KEY="YOUR_AWS_SECRET_KEY"
+        export AWS_SESSION_TOKEN="YOUR_SESSION_TOKEN" # (Optional)
+        ```
+    *   Shared Credentials File (`~/.aws/credentials`)
+
+*   **For Pasqal & Infleqtion:**
+    Set `PASQAL_API_KEY` and `SUPERSTAQ_API_KEY` respectively.
+
+## CLI Usage
+
+A simple Command-Line Interface is provided for quick demonstrations. It runs a standard Bell State circuit on the specified backend.
+
+**Example:**
+
+```bash
+python rocq_cli.py run --backend ionq --shots 100
+```
+
+This command will:
+1.  Check for the `IONQ_API_KEY`.
+2.  Target the IonQ simulator.
+3.  Submit a Bell State circuit for 100 shots.
+4.  Poll for and print the final measurement results.
 
 ## Supported Backends
 
-The framework is designed for extensibility. The following backends are currently integrated or have skeletons in place for future development:
+The framework is designed for extensibility. The following backends are currently integrated:
 
-*   **Alice & Bob** (Skeleton)
-*   **Infleqtion**
-*   **IonQ**
-*   **IQM** (Skeleton)
-*   **ORCA Computing** (Skeleton)
-*   **Pasqal**
-*   **Quantinuum**
-*   **Quantum Brilliance (Qristal)**
-*   **Quantum Machines** (Skeleton)
-*   **QuEra** (Skeleton)
-*   **Rigetti** (Skeleton)
-*   **SEEQC** (Skeleton)
-*   **Xanadu** (Skeleton)
+| Provider           | Backend Name | Status      | Type              |
+| ------------------ | ------------ | ----------- | ----------------- |
+| **IonQ**           | `ionq`       | Implemented | A (Remote API)    |
+| **Quantinuum**     | `quantinuum` | Implemented | A (Remote API)    |
+| **Pasqal**         | `pasqal`     | Implemented | A (Remote API)    |
+| **Infleqtion**     | `infleqtion` | Implemented | A (Remote API)    |
+| **Quantum Brilliance** | `qristal`    | Implemented | B (Local SDK)     |
+| **Rigetti**        | `rigetti`    | Implemented | C (Cloud Intermediary)|
+| **Alice & Bob**    | `alice_bob`  | Skeleton    | -                 |
+| **IQM**            | `iqm`        | Skeleton    | -                 |
+| **ORCA Computing** | `orca`       | Skeleton    | -                 |
+| **Quantum Machines**| `qm`         | Skeleton    | -                 |
+| **QuEra**          | `quera`      | Skeleton    | -                 |
+| **SEEQC**          | `seeqc`      | Skeleton    | -                 |
+| **Xanadu**         | `xanadu`     | Skeleton    | -                 |
 
-## Usage
+## Full Example
 
-The following example demonstrates the power of the framework: a single circuit is defined and then run on both a Type A (remote API) backend and a Type B (local SDK) backend.
-
-```python
-# examples/run_bell_state.py
-
-"""
-"Hello, Quantum World!" - A rocQuantum Showcase
-
-This script demonstrates the core functionality and vision of the rocQuantum
-framework: to define a quantum circuit once and execute it on vastly different
-backend architectures with minimal code changes.
-"""
-
-import os
-import sys
-import time
-
-# Add the project root to the Python path to allow for direct imports
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, project_root)
-
-from rocquantum.circuit import QuantumCircuit
-from rocquantum.core import set_target, get_active_backend
-
-def main():
-    """Defines and runs a Bell State circuit on multiple backends."""
-
-    # 1. Define the Quantum Circuit Programmatically
-    print("--> Step 1: Building the quantum circuit for a Bell State...")
-    bell_circuit = QuantumCircuit(num_qubits=2)
-    bell_circuit.h(0)
-    bell_circuit.cx(0, 1)
-    print("--> Circuit built successfully.")
-    print(f"    QASM representation:\n{bell_circuit.to_qasm()}\n")
-
-    # --- Execution on a Type A Backend (Remote API) ---
-    print("--- Running on a Type A Backend (IonQ Simulator) ---")
-    try:
-        # 2. Set the Target Backend
-        if not os.getenv("IONQ_API_KEY"):
-            raise EnvironmentError("IONQ_API_KEY not set. Skipping IonQ execution.")
-        
-        set_target('ionq', backend_name='simulator')
-        backend = get_active_backend()
-
-        # 3. Submit the Job
-        print("--> Submitting job to IonQ simulator...")
-        job_id = backend.submit_job(bell_circuit.to_qasm(), shots=100)
-        print(f"--> Job submitted. ID: {job_id}")
-
-        # 4. Retrieve Results
-        print("--> Polling for results...")
-        while True:
-            status = backend.get_job_status(job_id)
-            print(f"    Job status: {status}")
-            if status == 'completed':
-                results = backend.get_job_result(job_id)
-                print(f"--> Results received: {results}\n")
-                break
-            elif status in ['failed', 'cancelled']:
-                print("--> Job did not complete successfully.\n")
-                break
-            time.sleep(2)
-
-    except Exception as e:
-        print(f"[ERROR] Could not run on IonQ backend: {e}\n")
-
-    # --- Execution on a Type B Backend (Local SDK) ---
-    print("--- Running on a Type B Backend (Qristal Simulator) ---")
-    try:
-        # 2. Set the Target Backend
-        set_target('qristal')
-        backend = get_active_backend()
-
-        # 3. Submit the Job
-        print("--> Submitting job to local Qristal simulator...")
-        job_id = backend.submit_job(bell_circuit, shots=100)
-        
-        # 4. Retrieve Results
-        status = backend.get_job_status(job_id)
-        print(f"    Job status: {status}")
-        if status == 'completed':
-            results = backend.get_job_result(job_id)
-            print(f"--> Results received: {results}\n")
-
-    except Exception as e:
-        print(f"[ERROR] Could not run on Qristal backend: {e}\n")
-
-if __name__ == "__main__":
-    main()
-```
+The script in `examples/run_bell_state.py` demonstrates the power of the framework by defining a single circuit and running it on three different backend types: IonQ (API), Qristal (local SDK), and Rigetti (cloud intermediary).
