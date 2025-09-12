@@ -3,10 +3,6 @@
 """
 This module serves as the central management hub for backend clients 
 in the rocQuantum framework.
-
-It provides the core functionality for dynamically selecting, instantiating,
-and authenticating hardware backends, making them available to the rest of
-the platform through a simple, unified interface.
 """
 
 import importlib
@@ -14,56 +10,34 @@ from typing import Dict, Type, Optional
 
 from .backends.base import RocqBackend
 
-# ==============================================================================
-#  Global State Management
-# ==============================================================================
-
-# Holds the currently active and authenticated backend instance.
-_ACTIVE_BACKEND: Optional[RocqBackend] = None
-
-# A registry of available backends. Maps a user-friendly name to the
-# full import path of the corresponding backend class. This allows for
-# easy extension with new hardware providers.
 _AVAILABLE_BACKENDS: Dict[str, str] = {
+    # --- Implemented Backends ---
     "ionq": "rocquantum.backends.ionq.IonQBackend",
-    # Add other backends here as they are implemented, e.g.:
-    # "quantinuum": "rocquantum.backends.quantinuum.QuantinuumBackend",
+    "infleqtion": "rocquantum.backends.infleqtion.InfleqtionBackend",
+    "pasqal": "rocquantum.backends.pasqal.PasqalBackend",
+    "quantinuum": "rocquantum.backends.quantinuum.QuantinuumBackend",
+    "qristal": "rocquantum.backends.qristal.QuantumBrillianceBackend",
+
+    # --- Skeleton Backends ---
+    "iqm": "rocquantum.backends.iqm.IQMBackend",
+    "rigetti": "rocquantum.backends.rigetti.RigettiBackend",
+    "xanadu": "rocquantum.backends.xanadu.XanaduBackend",
+    "quera": "rocquantum.backends.quera.QuEraBackend",
+    "orca": "rocquantum.backends.orca.OrcaBackend",
+    "seeqc": "rocquantum.backends.seeqc.SeeqcBackend",
+    "quantum_machines": "rocquantum.backends.quantum_machines.QuantumMachinesBackend",
+    "alice_bob": "rocquantum.backends.alice_bob.AliceBobBackend",
 }
 
-# ==============================================================================
-#  Public API Functions
-# ==============================================================================
+_ACTIVE_BACKEND: Optional[RocqBackend] = None
 
 def set_target(name: str, **kwargs) -> None:
-    """
-    Selects, instantiates, and authenticates a quantum backend.
-
-    This function acts as the primary entry point for configuring the target
-    QPU. It dynamically imports the specified backend class, initializes it
-    with any provided arguments, and calls its authentication method.
-
-    Args:
-        name (str): The name of the backend to activate (e.g., 'ionq').
-        **kwargs: Additional keyword arguments to be passed to the backend's
-                  constructor (e.g., `backend_name='ionq_simulator'`).
-
-    Raises:
-        ValueError: If the specified backend name is not found in the
-                    `_AVAILABLE_BACKENDS` registry.
-        ImportError: If the backend class cannot be imported.
-        Exception: Propagates exceptions from the backend's __init__ or
-                   authenticate() methods (e.g., BackendAuthenticationError).
-    """
+    """Selects, instantiates, and authenticates a quantum backend."""
     global _ACTIVE_BACKEND
-
     if name not in _AVAILABLE_BACKENDS:
-        raise ValueError(
-            f"Backend '{name}' not recognized. "
-            f"Available backends are: {list(_AVAILABLE_BACKENDS.keys())}"
-        )
-
-    import_path = _AVAILABLE_BACKENDS[name]
+        raise ValueError(f"Backend '{name}' not recognized. Available: {list(_AVAILABLE_BACKENDS.keys())}")
     
+    import_path = _AVAILABLE_BACKENDS[name]
     try:
         module_path, class_name = import_path.rsplit(".", 1)
         module = importlib.import_module(module_path)
@@ -71,29 +45,12 @@ def set_target(name: str, **kwargs) -> None:
     except (ImportError, AttributeError) as e:
         raise ImportError(f"Could not import backend class '{import_path}': {e}")
 
-    # Instantiate the backend with any provided kwargs
-    backend_instance = backend_class(**kwargs)
-    
-    # Authenticate the backend before setting it as active
-    backend_instance.authenticate()
-    
-    # Set the successfully authenticated instance as the active backend
-    _ACTIVE_BACKEND = backend_instance
-
+    instance = backend_class(**kwargs)
+    instance.authenticate()
+    _ACTIVE_BACKEND = instance
 
 def get_active_backend() -> RocqBackend:
-    """
-    Retrieves the currently active backend instance.
-
-    Returns:
-        RocqBackend: The active and authenticated backend client.
-
-    Raises:
-        RuntimeError: If no backend has been set via `set_target()`.
-    """
+    """Retrieves the currently active backend instance."""
     if _ACTIVE_BACKEND is None:
-        raise RuntimeError(
-            "No active backend. Please call `set_target('backend_name')` "
-            "to select and authenticate a backend first."
-        )
+        raise RuntimeError("No active backend. Call set_target() first.")
     return _ACTIVE_BACKEND

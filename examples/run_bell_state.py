@@ -1,52 +1,3 @@
-# rocQuantum
-
-A hardware-agnostic quantum computing framework, inspired by the architecture of NVIDIA's CUDA-Q, designed to provide a unified interface for executing quantum circuits across a wide range of third-party quantum processing units (QPUs).
-
-## Description
-
-The core goal of rocQuantum is to offer a seamless user experience where a quantum circuit can be defined once and then executed on different hardware backends—from remote, API-based cloud platforms to local, SDK-driven simulators—with minimal changes to the code. This is achieved through a robust backend abstraction layer that supports two primary integration models:
-
-*   **Type A (Indirect):** For API-based services (e.g., IonQ, Quantinuum), rocQuantum manages the HTTP client, authentication, and job lifecycle internally.
-*   **Type B (Direct):** For providers that require a local SDK (e.g., Quantum Brilliance), rocQuantum interfaces directly with the provider's tools.
-
-## Installation
-
-1.  Clone the repository:
-    ```bash
-    git clone <repository-url>
-    cd rocQuantum-1
-    ```
-
-2.  Install the required Python packages:
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-3.  Configure backend credentials by setting the appropriate environment variables (e.g., `IONQ_API_KEY`, `CUDAQ_QUANTINUUM_CREDENTIALS`).
-
-## Supported Backends
-
-The framework is designed for extensibility. The following backends are currently integrated or have skeletons in place for future development:
-
-*   **Alice & Bob** (Skeleton)
-*   **Infleqtion**
-*   **IonQ**
-*   **IQM** (Skeleton)
-*   **ORCA Computing** (Skeleton)
-*   **Pasqal**
-*   **Quantinuum**
-*   **Quantum Brilliance (Qristal)**
-*   **Quantum Machines** (Skeleton)
-*   **QuEra** (Skeleton)
-*   **Rigetti** (Skeleton)
-*   **SEEQC** (Skeleton)
-*   **Xanadu** (Skeleton)
-
-## Usage
-
-The following example demonstrates the power of the framework: a single circuit is defined and then run on both a Type A (remote API) backend and a Type B (local SDK) backend.
-
-```python
 # examples/run_bell_state.py
 
 """
@@ -72,10 +23,13 @@ def main():
     """Defines and runs a Bell State circuit on multiple backends."""
 
     # 1. Define the Quantum Circuit Programmatically
+    # Using the QuantumCircuit class, we can build our circuit without
+    # writing any raw QASM. This provides a clean, Pythonic interface.
     print("--> Step 1: Building the quantum circuit for a Bell State...")
     bell_circuit = QuantumCircuit(num_qubits=2)
     bell_circuit.h(0)
     bell_circuit.cx(0, 1)
+    # Measurement is added automatically by the to_qasm() method if not present.
     print("--> Circuit built successfully.")
     print(f"    QASM representation:\n{bell_circuit.to_qasm()}\n")
 
@@ -83,6 +37,9 @@ def main():
     print("--- Running on a Type A Backend (IonQ Simulator) ---")
     try:
         # 2. Set the Target Backend
+        # This single line of code is all that's needed to switch hardware.
+        # Here, we target the IonQ simulator.
+        # NOTE: This requires the IONQ_API_KEY environment variable to be set.
         if not os.getenv("IONQ_API_KEY"):
             raise EnvironmentError("IONQ_API_KEY not set. Skipping IonQ execution.")
         
@@ -90,6 +47,7 @@ def main():
         backend = get_active_backend()
 
         # 3. Submit the Job
+        # For a Type A backend, we submit the QASM string representation.
         print("--> Submitting job to IonQ simulator...")
         job_id = backend.submit_job(bell_circuit.to_qasm(), shots=100)
         print(f"--> Job submitted. ID: {job_id}")
@@ -115,14 +73,18 @@ def main():
     print("--- Running on a Type B Backend (Qristal Simulator) ---")
     try:
         # 2. Set the Target Backend
+        # Now, we switch to a completely different architecture.
         set_target('qristal')
         backend = get_active_backend()
 
         # 3. Submit the Job
+        # For this Type B backend, we submit the QuantumCircuit object directly.
+        # The job runs synchronously.
         print("--> Submitting job to local Qristal simulator...")
         job_id = backend.submit_job(bell_circuit, shots=100)
         
         # 4. Retrieve Results
+        # Since it's a synchronous run, we can get results immediately.
         status = backend.get_job_status(job_id)
         print(f"    Job status: {status}")
         if status == 'completed':
@@ -134,4 +96,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
