@@ -20,6 +20,8 @@ public:
 private:
     rocsvHandle_t sim_handle;
     unsigned num_qubits;
+    rocComplex* device_state;
+    size_t batch_size;
     bool is_initialized;
 };
 

@@ -61,6 +61,14 @@ rocqStatus_t rocsvDestroy(rocsvHandle_t handle);
 rocqStatus_t rocsvAllocateState(rocsvHandle_t handle, unsigned numQubits, rocComplex** d_state, size_t batchSize);
 
 /**
+ * @brief Releases device memory associated with the state vector allocated via rocsvAllocateState.
+ *
+ * @param[in] handle The hipStateVec handle.
+ * @return rocqStatus_t Status of the operation.
+ */
+rocqStatus_t rocsvFreeState(rocsvHandle_t handle);
+
+/**
  * @brief Initializes the state vector to the |0...0> state.
  *
  * @param[in] handle The hipStateVec handle.
