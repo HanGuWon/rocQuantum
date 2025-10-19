@@ -24,6 +24,7 @@ add_library(rocquantum STATIC
 # Add include directories for the library
 target_include_directories(rocquantum PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/rocquantum/include
 )
 
@@ -46,5 +47,6 @@ target_link_libraries(rocquantum_bind PRIVATE
 # Add include directories for the binding module
 target_include_directories(rocquantum_bind PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${pybind11_INCLUDE_DIRS}
 )

@@ -1,10 +1,13 @@
-#include "rocquantum/include/rocquantum.h"
-#include <iostream>
-#include <vector>
+#include "rocquantum/QuantumSimulator.h"
+#include <algorithm>
+#include <cmath>
 #include <complex>
-#include <stdexcept>
+#include <cctype>
+#include <iostream>
 #include <map>
 #include <random>
+#include <stdexcept>
+#include <vector>
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_complex.h>
@@ -44,8 +47,24 @@ static const std::map<std::string, std::vector<std::complex<double>>> predefined
     {"Identity", {{1,0}, {0,0}, {0,0}, {1,0}}}
 };
 
-QuantumSimulator::QuantumSimulator(unsigned num_qubits) : num_qubits_(num_qubits), device_state_vector_(nullptr) {
-    state_vec_size_ = 1 << num_qubits_;
+namespace {
+std::string normalize_gate_name(const std::string& gate_name) {
+    std::string upper;
+    upper.reserve(gate_name.size());
+    std::transform(gate_name.begin(), gate_name.end(), std::back_inserter(upper),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return upper;
+}
+} // namespace
+
+QuantumSimulator::QuantumSimulator(unsigned num_qubits)
+    : num_qubits_(num_qubits),
+      state_vec_size_(0),
+      device_state_vector_(nullptr) {
+    if (num_qubits_ == 0) {
+        throw std::invalid_argument("QuantumSimulator requires at least one qubit.");
+    }
+    state_vec_size_ = 1ULL << num_qubits_;
     size_t mem_size = state_vec_size_ * sizeof(hipDoubleComplex);
     HIP_CHECK(hipMalloc(&device_state_vector_, mem_size));
     this->reset();
@@ -65,29 +84,39 @@ void QuantumSimulator::reset() {
 }
 
 void QuantumSimulator::apply_gate(const std::string& gate_name, const std::vector<unsigned>& targets, const std::vector<double>& params) {
-    if (gate_name == "CNOT" || gate_name == "cx") {
+    if (targets.empty()) {
+        throw std::invalid_argument("apply_gate requires at least one target qubit.");
+    }
+    const std::string normalized = normalize_gate_name(gate_name);
+
+    for (unsigned t : targets) {
+        ensure_valid_qubit(t);
+    }
+
+    if (normalized == "CNOT" || normalized == "CX") {
         if (targets.size() != 2) throw std::runtime_error("CNOT requires 2 target qubits.");
+        if (num_qubits_ < 2) throw std::runtime_error("CNOT requires at least two qubits in the simulator.");
         unsigned int control = targets[0], target = targets[1];
         
-        unsigned int num_threads = 1 << (num_qubits_ - 2);
+        unsigned int num_threads = (num_qubits_ <= 1) ? 1u : 1u << (num_qubits_ - 2);
         unsigned int threads_per_block = 256;
         unsigned int blocks = (num_threads + threads_per_block - 1) / threads_per_block;
         
         hipLaunchKernelGGL(apply_cnot_gate, dim3(blocks), dim3(threads_per_block), 0, 0, 
                            device_state_vector_, num_qubits_, control, target);
-        HIP_CHECK(hipDeviceSynchronize());
+        synchronize();
         return;
     }
 
-    if (gate_name == "RX" || gate_name == "RY" || gate_name == "RZ") {
+    if (normalized == "RX" || normalized == "RY" || normalized == "RZ") {
         if (params.empty()) throw std::runtime_error("Rotation gate requires an angle parameter.");
-        auto matrix = get_rotation_matrix(gate_name, params[0]);
+        auto matrix = get_rotation_matrix(normalized, params[0]);
         this->apply_matrix(matrix, targets);
         return;
     }
 
-    if (predefined_gates.count(gate_name)) {
-        this->apply_matrix(predefined_gates.at(gate_name), targets);
+    if (predefined_gates.count(normalized)) {
+        this->apply_matrix(predefined_gates.at(normalized), targets);
         return;
     }
     
@@ -97,6 +126,7 @@ void QuantumSimulator::apply_gate(const std::string& gate_name, const std::vecto
 void QuantumSimulator::apply_matrix(const std::vector<std::complex<double>>& matrix, const std::vector<unsigned>& targets) {
     if (targets.size() != 1) throw std::runtime_error("Only single-qubit matrices are supported.");
     if (matrix.size() != 4) throw std::runtime_error("Matrix must have 4 elements.");
+    ensure_valid_qubit(targets.front());
     
     hipDoubleComplex* device_unitary;
     HIP_CHECK(hipMalloc(&device_unitary, 4 * sizeof(hipDoubleComplex)));
@@ -109,11 +139,11 @@ void QuantumSimulator::apply_matrix(const std::vector<std::complex<double>>& mat
     hipLaunchKernelGGL(apply_single_qubit_gate, dim3(blocks), dim3(threads_per_block), 0, 0, 
                        device_state_vector_, num_qubits_, targets[0], device_unitary);
     
-    HIP_CHECK(hipDeviceSynchronize());
+    synchronize();
     HIP_CHECK(hipFree(device_unitary));
 }
 
-std::vector<std::complex<double>> QuantumSimulator::get_statevector() {
+std::vector<std::complex<double>> QuantumSimulator::get_statevector() const {
     std::vector<std::complex<double>> host_state_vector(state_vec_size_);
     size_t mem_size = state_vec_size_ * sizeof(hipDoubleComplex);
     HIP_CHECK(hipMemcpy(host_state_vector.data(), device_state_vector_, mem_size, hipMemcpyDeviceToHost));
@@ -121,6 +151,9 @@ std::vector<std::complex<double>> QuantumSimulator::get_statevector() {
 }
 
 std::vector<long long> QuantumSimulator::measure(const std::vector<unsigned>& qubits, int shots) {
+    for (unsigned q : qubits) {
+        ensure_valid_qubit(q);
+    }
     // 1. Calculate probabilities on GPU
     double* device_probabilities;
     size_t probs_mem_size = state_vec_size_ * sizeof(double);
@@ -148,6 +181,40 @@ std::vector<long long> QuantumSimulator::measure(const std::vector<unsigned>& qu
     }
     
     return results;
+}
+
+unsigned QuantumSimulator::num_qubits() const noexcept {
+    return num_qubits_;
+}
+
+void QuantumSimulator::ApplyGate(const std::string& gate_name, int target_qubit) {
+    apply_gate(gate_name, {static_cast<unsigned>(target_qubit)}, {});
+}
+
+void QuantumSimulator::ApplyGate(const std::string& gate_name, int control_qubit, int target_qubit) {
+    apply_gate(gate_name, {static_cast<unsigned>(control_qubit), static_cast<unsigned>(target_qubit)}, {});
+}
+
+void QuantumSimulator::ApplyGate(const std::vector<std::complex<double>>& gate_matrix, int target_qubit) {
+    apply_matrix(gate_matrix, {static_cast<unsigned>(target_qubit)});
+}
+
+void QuantumSimulator::Execute() {
+    synchronize();
+}
+
+std::vector<std::complex<double>> QuantumSimulator::GetStateVector() const {
+    return get_statevector();
+}
+
+void QuantumSimulator::ensure_valid_qubit(unsigned qubit) const {
+    if (qubit >= num_qubits_) {
+        throw std::out_of_range("Qubit index out of bounds for simulator instance.");
+    }
+}
+
+void QuantumSimulator::synchronize() const {
+    HIP_CHECK(hipDeviceSynchronize());
 }
 
 } // namespace rocquantum
