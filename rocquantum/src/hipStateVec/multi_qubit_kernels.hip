@@ -223,33 +223,87 @@ __global__ void scatter_elements_kernel_v2(
 
 // --- NEWLY ADDED KERNELS ---
 
-// Generic kernel for applying a multi-controlled single-target gate (e.g., X, Z)
-__global__ void apply_multi_controlled_gate_kernel(
-    rocComplex* state,
-    unsigned numQubits,
-    const unsigned* controlQubits_gpu,
-    unsigned numControlQubits,
-    unsigned targetQubit,
-    const rocComplex* gateMatrix_gpu // 2x2 matrix for the target operation (e.g., Pauli X)
-);
+// Multi-controlled X gate (generalised Toffoli). controlMask contains all control qubits.
+__global__ void apply_multi_controlled_x_kernel(rocComplex* state,
+                                                unsigned numQubits,
+                                                unsigned long long controlMask,
+                                                unsigned targetQubit,
+                                                size_t batchSize) {
+    const size_t thread_id = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total_threads = static_cast<size_t>(gridDim.x) * blockDim.x;
 
-// Kernel for applying a controlled rotation gate (CRX, CRY, CRZ)
-__global__ void apply_controlled_rotation_kernel(
-    rocComplex* state,
-    unsigned numQubits,
-    unsigned controlQubit,
-    unsigned targetQubit,
-    const rocComplex* gateMatrix_gpu // 2x2 rotation matrix
-);
+    const size_t num_elements_per_state = 1ULL << numQubits;
+    const size_t total_states = batchSize * num_elements_per_state;
+    const size_t target_mask = 1ULL << targetQubit;
 
-// Kernel for CSWAP (Fredkin) gate
-__global__ void apply_CSWAP_kernel(
-    rocComplex* state,
-    unsigned numQubits,
-    unsigned controlQubit,
-    unsigned targetQubit1,
-    unsigned targetQubit2
-);
+    if (controlMask == 0ULL) {
+        return;
+    }
+
+    for (size_t linear_idx = thread_id; linear_idx < total_states; linear_idx += total_threads) {
+        const size_t batch_idx = linear_idx / num_elements_per_state;
+        const size_t basis_state = linear_idx % num_elements_per_state;
+
+        if ((basis_state & target_mask) != 0ULL) {
+            continue; // operate only on branch where target bit is 0
+        }
+
+        if ((basis_state & controlMask) != controlMask) {
+            continue;
+        }
+
+        const size_t swapped_state = basis_state | target_mask;
+        const size_t batch_offset = batch_idx * num_elements_per_state;
+
+        const size_t idx0 = batch_offset + basis_state;
+        const size_t idx1 = batch_offset + swapped_state;
+
+        const rocComplex temp = state[idx0];
+        state[idx0] = state[idx1];
+        state[idx1] = temp;
+    }
+}
+
+// CSWAP (Fredkin) gate with a single control qubit.
+__global__ void apply_CSWAP_kernel(rocComplex* state,
+                                   unsigned numQubits,
+                                   unsigned controlQubit,
+                                   unsigned targetQubit1,
+                                   unsigned targetQubit2,
+                                   size_t batchSize) {
+    const size_t thread_id = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total_threads = static_cast<size_t>(gridDim.x) * blockDim.x;
+
+    const size_t num_elements_per_state = 1ULL << numQubits;
+    const size_t total_states = batchSize * num_elements_per_state;
+
+    const size_t control_mask = 1ULL << controlQubit;
+    const size_t t1_mask = 1ULL << targetQubit1;
+    const size_t t2_mask = 1ULL << targetQubit2;
+
+    for (size_t linear_idx = thread_id; linear_idx < total_states; linear_idx += total_threads) {
+        const size_t batch_idx = linear_idx / num_elements_per_state;
+        const size_t basis_state = linear_idx % num_elements_per_state;
+
+        if ((basis_state & control_mask) == 0ULL) {
+            continue;
+        }
+
+        const bool t1_set = (basis_state & t1_mask) != 0ULL;
+        const bool t2_set = (basis_state & t2_mask) != 0ULL;
+        if (t1_set || !t2_set) {
+            continue; // Only operate on |01> branch to avoid double swapping.
+        }
+
+        const size_t swapped_state = (basis_state | t1_mask) & ~t2_mask;
+        const size_t batch_offset = batch_idx * num_elements_per_state;
+        const size_t idx0 = batch_offset + basis_state;
+        const size_t idx1 = batch_offset + swapped_state;
+
+        const rocComplex temp = state[idx0];
+        state[idx0] = state[idx1];
+        state[idx1] = temp;
+    }
+}
 
 // --- END NEWLY ADDED KERNELS ---
-

@@ -37,16 +37,15 @@ if not os.path.exists(ROCQUANTUM_PATH):
 
 # Define include and library paths
 include_dirs = [
-    # Path to the rocQuantum-1 headers
     os.path.join(ROCQUANTUM_PATH, "include"),
-    # Path to ROCm/HIP headers
+    os.path.join(ROCQUANTUM_PATH, "rocquantum", "include"),
     os.path.join(ROCM_PATH, "include"),
 ]
 
 library_dirs = [
-    # Path to the compiled rocQuantum-1 library (if it's pre-compiled)
-    os.path.join(ROCQUANTUM_PATH, "lib"),
-    # Path to ROCm/HIP libraries
+    os.path.join(ROCQUANTUM_PATH, "build"),
+    os.path.join(ROCQUANTUM_PATH, "build", "rocquantum", "src", "hipStateVec"),
+    os.path.join(ROCQUANTUM_PATH, "build", "rocquantum", "src", "hipTensorNet"),
     os.path.join(ROCM_PATH, "lib"),
 ]
 
@@ -63,16 +62,15 @@ ext_modules = [
         ["bindings.cpp"],
         include_dirs=include_dirs,
         library_dirs=library_dirs,
-        # For a real build, you would link against your compiled rocquantum library
-        # and the HIP runtime library.
-        # Example for Linux: libraries=["rocquantum", "amdhip64"]
-        # On Windows, the library names might be different (e.g., "rocquantum.lib").
-        # For this foundational step, we are not linking a pre-compiled library,
-        # but in a real project, you would uncomment and adjust the following line:
-        # libraries=["rocquantum", "hipamd64"], # Adjust library names for your OS
-        
-        # Compiler and linker arguments can be platform-specific.
-        # For MSVC on Windows:
+        libraries=[
+            "rocquantum",
+            "hipStateVec",
+            "rocqsim_tensornet",
+            "amdhip64",
+            "hiprand",
+            "rocblas",
+            "rocsolver",
+        ],
         extra_compile_args=["/EHsc", "/std:c++17"] if sys.platform == "win32" else ["-std=c++17"],
         extra_link_args=[],
     ),

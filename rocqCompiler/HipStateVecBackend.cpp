@@ -93,6 +93,30 @@ void HipStateVecBackend::apply_gate(const std::string& gate_name, const std::vec
     } else if (lowered == "swap") {
         if (targets.size() < 2) throw std::invalid_argument("SWAP requires two qubit indices.");
         check_status(rocsvApplySWAP(sim_handle, device_state, num_qubits, targets[0], targets[1]), "apply SWAP");
+    } else if (lowered == "ccx" || lowered == "toffoli" || lowered == "mcx") {
+        if (targets.size() < 2) {
+            throw std::invalid_argument("Multi-controlled X requires at least one control and one target.");
+        }
+        const unsigned target = targets.back();
+        std::vector<unsigned> controls(targets.begin(), targets.end() - 1);
+        check_status(rocsvApplyMultiControlledX(sim_handle,
+                                                device_state,
+                                                num_qubits,
+                                                controls.data(),
+                                                static_cast<unsigned>(controls.size()),
+                                                target),
+                     "apply multi-controlled X");
+    } else if (lowered == "cswap" || lowered == "fredkin") {
+        if (targets.size() != 3) {
+            throw std::invalid_argument("CSWAP requires control, target1, target2 indices.");
+        }
+        check_status(rocsvApplyCSWAP(sim_handle,
+                                     device_state,
+                                     num_qubits,
+                                     targets[0],
+                                     targets[1],
+                                     targets[2]),
+                     "apply CSWAP");
     } else {
         throw std::runtime_error("Unknown gate: " + gate_name);
     }
@@ -101,7 +125,48 @@ void HipStateVecBackend::apply_gate(const std::string& gate_name, const std::vec
 void HipStateVecBackend::apply_parametrized_gate(const std::string& gate_name,
                                                  double parameter,
                                                  const std::vector<unsigned>& targets) {
-    throw std::runtime_error("Parametrized gates are not yet implemented for hipStateVec.");
+    if (!is_initialized) throw std::runtime_error("Backend not initialized.");
+    if (targets.empty()) throw std::invalid_argument("Parametrised gate requires target qubits.");
+
+    const std::string lowered = to_lower(gate_name);
+
+    auto require_single_target = [&targets]() -> unsigned {
+        if (targets.size() != 1) {
+            throw std::invalid_argument("This gate expects exactly one target qubit.");
+        }
+        return targets[0];
+    };
+
+    if (lowered == "rx") {
+        const unsigned target = require_single_target();
+        check_status(rocsvApplyRx(sim_handle, device_state, num_qubits, target, parameter), "apply RX");
+    } else if (lowered == "ry") {
+        const unsigned target = require_single_target();
+        check_status(rocsvApplyRy(sim_handle, device_state, num_qubits, target, parameter), "apply RY");
+    } else if (lowered == "rz") {
+        const unsigned target = require_single_target();
+        check_status(rocsvApplyRz(sim_handle, device_state, num_qubits, target, parameter), "apply RZ");
+    } else if (lowered == "crx") {
+        if (targets.size() != 2) {
+            throw std::invalid_argument("CRX requires control and target qubits.");
+        }
+        check_status(rocsvApplyCRX(sim_handle, device_state, num_qubits, targets[0], targets[1], parameter),
+                     "apply CRX");
+    } else if (lowered == "cry") {
+        if (targets.size() != 2) {
+            throw std::invalid_argument("CRY requires control and target qubits.");
+        }
+        check_status(rocsvApplyCRY(sim_handle, device_state, num_qubits, targets[0], targets[1], parameter),
+                     "apply CRY");
+    } else if (lowered == "crz") {
+        if (targets.size() != 2) {
+            throw std::invalid_argument("CRZ requires control and target qubits.");
+        }
+        check_status(rocsvApplyCRZ(sim_handle, device_state, num_qubits, targets[0], targets[1], parameter),
+                     "apply CRZ");
+    } else {
+        throw std::runtime_error("Unknown parametrised gate: " + gate_name);
+    }
 }
 
 std::vector<std::complex<double>> HipStateVecBackend::get_state_vector() {
