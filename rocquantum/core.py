@@ -6,27 +6,57 @@ in the rocQuantum framework.
 """
 
 import importlib
-from typing import Dict, Type, Optional
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, Optional, Set, Type
 
 from .backends.base import RocqBackend
 
-_AVAILABLE_BACKENDS: Dict[str, str] = {
+@dataclass(frozen=True)
+class BackendSpec:
+    """Metadata that drives target selection and capability checks."""
+
+    import_path: str
+    backend_type: str
+    capabilities: Set[str] = field(default_factory=set)
+
+
+_AVAILABLE_BACKENDS: Dict[str, BackendSpec] = {
     # --- Implemented Backends ---
-    "ionq": "rocquantum.backends.ionq.IonQBackend",
-    "infleqtion": "rocquantum.backends.infleqtion.InfleqtionBackend",
-    "pasqal": "rocquantum.backends.pasqal.PasqalBackend",
-    "quantinuum": "rocquantum.backends.quantinuum.QuantinuumBackend",
-    "qristal": "rocquantum.backends.qristal.QuantumBrillianceBackend",
+    "ionq": BackendSpec(
+        import_path="rocquantum.backends.ionq.IonQBackend",
+        backend_type="remote_api",
+        capabilities={"sampling", "job_lifecycle", "qasm_submission"},
+    ),
+    "infleqtion": BackendSpec(
+        import_path="rocquantum.backends.infleqtion.InfleqtionBackend",
+        backend_type="remote_api",
+        capabilities={"sampling", "job_lifecycle", "qasm_submission"},
+    ),
+    "pasqal": BackendSpec(
+        import_path="rocquantum.backends.pasqal.PasqalBackend",
+        backend_type="remote_api",
+        capabilities={"sampling", "job_lifecycle", "qasm_submission"},
+    ),
+    "quantinuum": BackendSpec(
+        import_path="rocquantum.backends.quantinuum.QuantinuumBackend",
+        backend_type="remote_api",
+        capabilities={"sampling", "job_lifecycle", "qasm_submission"},
+    ),
+    "qristal": BackendSpec(
+        import_path="rocquantum.backends.qristal.QuantumBrillianceBackend",
+        backend_type="local_sdk",
+        capabilities={"sampling", "qasm_submission"},
+    ),
 
     # --- Skeleton Backends ---
-    "iqm": "rocquantum.backends.iqm.IQMBackend",
-    "rigetti": "rocquantum.backends.rigetti.RigettiBackend",
-    "xanadu": "rocquantum.backends.xanadu.XanaduBackend",
-    "quera": "rocquantum.backends.quera.QuEraBackend",
-    "orca": "rocquantum.backends.orca.OrcaBackend",
-    "seeqc": "rocquantum.backends.seeqc.SeeqcBackend",
-    "quantum_machines": "rocquantum.backends.quantum_machines.QuantumMachinesBackend",
-    "alice_bob": "rocquantum.backends.alice_bob.AliceBobBackend",
+    "iqm": BackendSpec("rocquantum.backends.iqm.IQMBackend", "skeleton", set()),
+    "rigetti": BackendSpec("rocquantum.backends.rigetti.RigettiBackend", "cloud_intermediary", {"sampling", "job_lifecycle", "qasm_submission"}),
+    "xanadu": BackendSpec("rocquantum.backends.xanadu.XanaduBackend", "skeleton", set()),
+    "quera": BackendSpec("rocquantum.backends.quera.QuEraBackend", "skeleton", set()),
+    "orca": BackendSpec("rocquantum.backends.orca.OrcaBackend", "skeleton", set()),
+    "seeqc": BackendSpec("rocquantum.backends.seeqc.SeeqcBackend", "skeleton", set()),
+    "quantum_machines": BackendSpec("rocquantum.backends.quantum_machines.QuantumMachinesBackend", "skeleton", set()),
+    "alice_bob": BackendSpec("rocquantum.backends.alice_bob.AliceBobBackend", "skeleton", set()),
 }
 
 _ACTIVE_BACKEND: Optional[RocqBackend] = None
@@ -37,7 +67,7 @@ def set_target(name: str, **kwargs) -> None:
     if name not in _AVAILABLE_BACKENDS:
         raise ValueError(f"Backend '{name}' not recognized. Available: {list(_AVAILABLE_BACKENDS.keys())}")
     
-    import_path = _AVAILABLE_BACKENDS[name]
+    import_path = _AVAILABLE_BACKENDS[name].import_path
     try:
         module_path, class_name = import_path.rsplit(".", 1)
         module = importlib.import_module(module_path)
@@ -48,6 +78,42 @@ def set_target(name: str, **kwargs) -> None:
     instance = backend_class(**kwargs)
     instance.authenticate()
     _ACTIVE_BACKEND = instance
+
+
+def get_target_spec(name: str) -> BackendSpec:
+    """Returns static metadata for a backend target."""
+    if name not in _AVAILABLE_BACKENDS:
+        raise ValueError(f"Backend '{name}' not recognized. Available: {list(_AVAILABLE_BACKENDS.keys())}")
+    return _AVAILABLE_BACKENDS[name]
+
+
+def list_targets(required_capabilities: Optional[Iterable[str]] = None) -> Dict[str, BackendSpec]:
+    """
+    Lists available targets, optionally filtered by required capabilities.
+
+    Examples:
+        list_targets()  # all configured backends
+        list_targets({"sampling", "job_lifecycle"})
+    """
+    if required_capabilities is None:
+        return dict(_AVAILABLE_BACKENDS)
+
+    required = set(required_capabilities)
+    return {
+        name: spec
+        for name, spec in _AVAILABLE_BACKENDS.items()
+        if required.issubset(spec.capabilities)
+    }
+
+
+def require_target_capability(name: str, capability: str) -> None:
+    """Validates that a target advertises a given capability before use."""
+    spec = get_target_spec(name)
+    if capability not in spec.capabilities:
+        raise RuntimeError(
+            f"Backend '{name}' does not advertise capability '{capability}'. "
+            f"Available capabilities: {sorted(spec.capabilities)}"
+        )
 
 def get_active_backend() -> RocqBackend:
     """Retrieves the currently active backend instance."""
