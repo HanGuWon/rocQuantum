@@ -51,6 +51,19 @@ To access third-party backends, you must configure your credentials using enviro
 *   **For Pasqal & Infleqtion:**
     Set `PASQAL_API_KEY` and `SUPERSTAQ_API_KEY` respectively.
 
+## Target Registry and Capability Filtering
+
+`rocquantum.core` now includes a target-registry metadata layer inspired by CUDA-Q style target/capability discovery.
+
+```python
+from rocquantum.core import list_targets, require_target_capability
+
+sampling_targets = list_targets({"sampling"})
+require_target_capability("ionq", "job_lifecycle")
+```
+
+This allows applications to select execution targets based on capabilities (e.g., sampling, job lifecycle management) instead of hard-coding provider names.
+
 ## CLI Usage
 
 A simple Command-Line Interface is provided for quick demonstrations. It runs a standard Bell State circuit on the specified backend.
